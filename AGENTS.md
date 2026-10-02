@@ -22,6 +22,9 @@ Verify changes with `npm run typecheck` and `cargo check` at minimum; run `cargo
   `library:scan` and `library:changed`. Audio format is detected from file contents (`Probe::guess_file_type`,
   plus the MP4 codec to tell AAC from ALAC), not the extension. Tracks with `format IS NULL` are backfilled on
   startup; new `tracks` columns are added in `Db::open` via `AUDIO_COLUMNS`.
+  Never auto-delete tracks whose files vanish: `mark_missing` hides them (`tracks.missing = 1`) and
+  `upsert_track` / `merge_moved` relink a moved file to its old row by title + artist + album + duration, so
+  lyrics offsets, play history and playlist entries survive. Only explicit "Remove from library" deletes.
 - `src-tauri/src/lyrics.rs`: lyrics lookup via the async `lyrics_get` command. Order: sidecar `.lrc` (never
   cached) > embedded tag > LRCLIB `/api/get` (exact signature) > `/api/search` (only results within ±4 s of the
   track length). Results, including misses, are cached in the `lyrics` table; misses are retried after 3 days.
