@@ -11,6 +11,9 @@ from the album art of whatever you're listening to.
 ![Platform](https://img.shields.io/badge/platform-Windows-0078d4?style=flat-square)
 ![Rust](https://img.shields.io/badge/Rust-backend-dea584?style=flat-square&logo=rust&logoColor=white)
 ![Tauri 2](https://img.shields.io/badge/Tauri-2-24c8db?style=flat-square&logo=tauri&logoColor=white)
+[![Latest release](https://img.shields.io/github/v/release/osfv/Reson?style=flat-square&color=white)](https://github.com/osfv/Reson/releases/latest)
+
+**[Download for Windows](https://github.com/osfv/Reson/releases/latest)**
 
 <img src="docs/screenshots/lyrics.png" alt="Now Playing with synced lyrics" width="860">
 
@@ -92,9 +95,17 @@ No account, no server, no streaming. Point Reson at a folder of FLACs or MP3s an
 
 **Formats:** FLAC, ALAC, MP3, AAC/M4A, OGG Vorbis and WAV.
 
-## Getting started
+## Download
 
-Reson doesn't have a prebuilt installer yet, so for now you build it yourself. You need:
+Grab **`Reson_x.y.z_x64-setup.exe`** from the [latest release](https://github.com/osfv/Reson/releases/latest) (Windows 10 and 11, 64-bit). It installs for your user account, no admin needed.
+
+The installer isn't code-signed yet, so Windows SmartScreen may warn you. Click **More info**, then **Run anyway**. The release notes list SHA-256 hashes if you want to check the file.
+
+Then click **Add music** in the sidebar, or drag a folder onto the window.
+
+## Building from source
+
+You need:
 
 - [Rust](https://rustup.rs) (stable)
 - [Node.js](https://nodejs.org) 20 or newer
@@ -107,8 +118,6 @@ npm install
 npm run tauri dev     # run with hot reload
 npm run tauri build   # release build and installer in src-tauri/target/release/bundle
 ```
-
-Then click **Add music** in the sidebar, or drag a folder onto the window.
 
 ## Keyboard shortcuts
 
