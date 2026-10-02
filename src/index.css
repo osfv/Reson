@@ -1,0 +1,231 @@
+@import "tailwindcss";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+
+/* Album-driven theme. Registered so the browser can interpolate between palettes. */
+@property --bg {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #141416;
+}
+@property --surface {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #202024;
+}
+@property --accent {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #f4b860;
+}
+@property --on-accent {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #1c1408;
+}
+
+/*
+ * Shape system: interactive controls are full pills, panels and menus are 16px (rounded-2xl),
+ * artwork is 8px (rounded-lg; 12px for the oversized Now Playing cover), list rows are 6px
+ * (rounded-md), and artist images are circles.
+ */
+@theme inline {
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, monospace;
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-accent: var(--accent);
+  --color-on-accent: var(--on-accent);
+  --color-ink: #f2f1ee;
+  --color-ink-muted: rgb(242 241 238 / 0.62);
+  --color-ink-faint: rgb(242 241 238 / 0.45);
+  --color-line: rgb(255 255 255 / 0.07);
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+:root {
+  color-scheme: dark;
+  background: var(--bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-feature-settings: "ss01", "cv11";
+  -webkit-font-smoothing: antialiased;
+  transition:
+    --bg 900ms ease,
+    --surface 900ms ease,
+    --accent 900ms ease,
+    --on-accent 900ms ease;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+}
+
+/* Element defaults live in the base layer so Tailwind utilities can override them. */
+@layer base {
+  body {
+    margin: 0;
+    user-select: none;
+    cursor: default;
+  }
+
+  input,
+  textarea {
+    user-select: text;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--accent) 45%, transparent);
+  }
+
+  button {
+    cursor: default;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(255 255 255 / 0.14) transparent;
+  }
+}
+
+.panel {
+  background: color-mix(in oklab, var(--surface) 38%, transparent);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.04);
+}
+
+/* Top bar becomes solid as the content scrolls under it (scroll-driven, no JS). */
+@keyframes topbar-solidify {
+  to {
+    background: color-mix(in oklab, var(--bg) 82%, transparent);
+    backdrop-filter: blur(20px) saturate(140%);
+    box-shadow: 0 1px 0 var(--color-line);
+  }
+}
+.topbar {
+  animation: topbar-solidify linear both;
+  animation-timeline: scroll(nearest);
+  animation-range: 0 96px;
+}
+
+@keyframes cover-in {
+  from {
+    opacity: 0;
+  }
+}
+.cover-in {
+  animation: cover-in 300ms ease-out;
+}
+
+/* Karaoke: each word fills left to right as it's sung. --p is written per frame from JS. */
+.karaoke-word {
+  --p: -8%;
+  background-image: linear-gradient(
+    90deg,
+    var(--color-ink) calc(var(--p) - 8%),
+    rgb(242 241 238 / 0.4) calc(var(--p) + 8%)
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+/* Now Playing backdrop: soft color fields from the cover, drifting slowly while music plays. */
+@keyframes np-drift-a {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(14vw, 10vh) scale(1.15); }
+  66% { transform: translate(-6vw, 18vh) scale(0.92); }
+}
+@keyframes np-drift-b {
+  0%, 100% { transform: translate(0, 0) scale(1.05); }
+  40% { transform: translate(-16vw, 8vh) scale(0.9); }
+  75% { transform: translate(-4vw, -12vh) scale(1.12); }
+}
+@keyframes np-drift-c {
+  0%, 100% { transform: translate(0, 0) scale(0.95); }
+  50% { transform: translate(18vw, -14vh) scale(1.18); }
+}
+.np-blob {
+  position: absolute;
+  width: 72vmax;
+  height: 72vmax;
+  border-radius: 9999px;
+  filter: blur(90px);
+  opacity: 0.8;
+  will-change: transform;
+  transition: background-color 1.6s ease;
+}
+.np-blob-1 { left: -24vmax; top: -30vmax; animation: np-drift-a 42s ease-in-out infinite; }
+.np-blob-2 { right: -26vmax; top: -18vmax; animation: np-drift-b 48s ease-in-out infinite; }
+.np-blob-3 { left: 10vmax; bottom: -40vmax; animation: np-drift-c 54s ease-in-out infinite; }
+.np-blob-4 { right: -10vmax; bottom: -46vmax; width: 50vmax; height: 50vmax; opacity: 0.32; animation: np-drift-a 60s ease-in-out infinite reverse; }
+.np-paused .np-blob { animation-play-state: paused; }
+
+/* While dragging songs, nothing should get selected and the cursor shows intent. */
+body.dragging,
+body.dragging * {
+  cursor: grabbing !important;
+  user-select: none !important;
+}
+
+@keyframes eq {
+  0%,
+  100% {
+    transform: scaleY(0.3);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+.eq span {
+  transform-origin: bottom;
+  animation: eq 900ms ease-in-out infinite;
+}
+.eq span:nth-child(2) {
+  animation-delay: -300ms;
+}
+.eq span:nth-child(3) {
+  animation-delay: -600ms;
+}
+.eq.paused span {
+  animation-play-state: paused;
+}
+
+@keyframes shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+.skeleton {
+  background: linear-gradient(90deg, rgb(255 255 255 / 0.04) 25%, rgb(255 255 255 / 0.08) 50%, rgb(255 255 255 / 0.04) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.6s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    transition: none;
+  }
+  .eq span,
+  .skeleton,
+  .cover-in,
+  .np-blob {
+    animation: none;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .topbar {
+    animation: none;
+    background: var(--bg);
+  }
+}

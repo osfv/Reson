@@ -1,0 +1,764 @@
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+
+use crate::lyrics::{Lyrics, LyricsQuery};
+use crate::media::NowPlayingInfo;
+use crate::palette::Palette;
+
+pub struct Db(Mutex<Connection>);
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Track {
+    pub id: i64,
+    pub path: String,
+    pub title: String,
+    pub artist: String,
+    pub album_id: i64,
+    pub track_no: Option<u32>,
+    pub disc_no: Option<u32>,
+    pub duration: f64,
+    pub genre: Option<String>,
+    pub added_at: i64,
+    #[serde(flatten)]
+    pub audio: AudioInfo,
+}
+
+/// What the file actually contains, detected from its bytes rather than its extension.
+#[derive(Serialize, Clone, Default, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioInfo {
+    pub format: Option<String>,
+    pub sample_rate: Option<u32>,
+    pub bit_depth: Option<u8>,
+    /// kbps
+    pub bitrate: Option<u32>,
+    pub channels: Option<u8>,
+    /// bytes
+    pub size: Option<i64>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Album {
+    pub id: i64,
+    pub title: String,
+    pub artist: String,
+    pub year: Option<u32>,
+    pub cover: Option<String>,
+    pub palette: Option<Palette>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Playlist {
+    pub id: i64,
+    pub name: String,
+    pub created_at: i64,
+    pub track_ids: Vec<i64>,
+}
+
+#[derive(Serialize)]
+pub struct Library {
+    pub tracks: Vec<Track>,
+    pub albums: Vec<Album>,
+    pub playlists: Vec<Playlist>,
+}
+
+/// Fields read from a file's tags, ready to be written to the library.
+pub struct TrackMeta {
+    pub path: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub album_artist: String,
+    pub track_no: Option<u32>,
+    pub disc_no: Option<u32>,
+    pub year: Option<u32>,
+    pub duration: f64,
+    pub genre: Option<String>,
+    pub mtime: i64,
+    pub audio: AudioInfo,
+    /// From ReplayGain tags when present (converted to LUFS); otherwise measured later.
+    pub loudness: Option<f64>,
+    pub peak: Option<f64>,
+}
+
+/// Columns added after the first release; created on open if missing.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("tracks", "format", "TEXT"),
+    ("tracks", "sample_rate", "INTEGER"),
+    ("tracks", "bit_depth", "INTEGER"),
+    ("tracks", "bitrate", "INTEGER"),
+    ("tracks", "channels", "INTEGER"),
+    ("tracks", "size", "INTEGER"),
+    ("tracks", "loudness", "REAL"),
+    ("tracks", "peak", "REAL"),
+    ("lyrics", "offset_ms", "INTEGER NOT NULL DEFAULT 0"),
+    // Files that vanished (moved, deleted, drive unplugged). Hidden, never deleted automatically,
+    // so lyrics offsets, history and playlists survive until the file is found again.
+    ("tracks", "missing", "INTEGER NOT NULL DEFAULT 0"),
+];
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct QueueSource {
+    pub id: i64,
+    pub path: String,
+    pub duration: f64,
+    #[serde(default)]
+    pub loudness: Option<f64>,
+    #[serde(default)]
+    pub peak: Option<f64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct History {
+    /// Album ids, most recently played first.
+    pub recent_albums: Vec<i64>,
+    /// Track ids, most recently played first (deduplicated).
+    pub recent_tracks: Vec<i64>,
+    /// (track id, play count) over the last 90 days, most played first.
+    pub top_tracks: Vec<(i64, i64)>,
+}
+
+pub fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+const SCHEMA: &str = "
+PRAGMA synchronous = NORMAL;
+PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS albums (
+  id INTEGER PRIMARY KEY,
+  title TEXT NOT NULL,
+  artist TEXT NOT NULL,
+  year INTEGER,
+  cover TEXT,
+  palette TEXT,
+  UNIQUE (title, artist)
+);
+CREATE TABLE IF NOT EXISTS tracks (
+  id INTEGER PRIMARY KEY,
+  path TEXT NOT NULL UNIQUE,
+  title TEXT NOT NULL,
+  artist TEXT NOT NULL,
+  album_id INTEGER NOT NULL REFERENCES albums(id),
+  track_no INTEGER,
+  disc_no INTEGER,
+  duration REAL NOT NULL,
+  genre TEXT,
+  mtime INTEGER NOT NULL,
+  added_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS tracks_album ON tracks(album_id);
+CREATE TABLE IF NOT EXISTS playlists (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS playlist_tracks (
+  playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+  track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS playlist_tracks_pl ON playlist_tracks(playlist_id, position);
+CREATE TABLE IF NOT EXISTS lyrics (
+  track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+  synced TEXT,
+  plain TEXT,
+  instrumental INTEGER NOT NULL,
+  source TEXT NOT NULL,
+  fetched_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS plays (
+  track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+  played_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS plays_time ON plays(played_at);
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+";
+
+impl Db {
+    pub fn open(path: &Path) -> rusqlite::Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
+        conn.execute_batch(SCHEMA)?;
+        for (table, col, ty) in ADDED_COLUMNS {
+            let exists: bool = conn.query_row(
+                &format!("SELECT COUNT(*) > 0 FROM pragma_table_info('{table}') WHERE name = ?"),
+                [col],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {ty}"))?;
+            }
+        }
+        Ok(Self(Mutex::new(conn)))
+    }
+
+    fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn library(&self) -> rusqlite::Result<Library> {
+        let conn = self.conn();
+        let tracks = conn
+            .prepare(
+                "SELECT id, path, title, artist, album_id, track_no, disc_no, duration, genre, added_at,
+                   format, sample_rate, bit_depth, bitrate, channels, size
+                 FROM tracks WHERE missing = 0
+                 ORDER BY artist COLLATE NOCASE, album_id, disc_no, track_no, title COLLATE NOCASE",
+            )?
+            .query_map([], |r| {
+                Ok(Track {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    title: r.get(2)?,
+                    artist: r.get(3)?,
+                    album_id: r.get(4)?,
+                    track_no: r.get(5)?,
+                    disc_no: r.get(6)?,
+                    duration: r.get(7)?,
+                    genre: r.get(8)?,
+                    added_at: r.get(9)?,
+                    audio: AudioInfo {
+                        format: r.get(10)?,
+                        sample_rate: r.get(11)?,
+                        bit_depth: r.get(12)?,
+                        bitrate: r.get(13)?,
+                        channels: r.get(14)?,
+                        size: r.get(15)?,
+                    },
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let albums = conn
+            .prepare(
+                "SELECT id, title, artist, year, cover, palette FROM albums
+                 WHERE id IN (SELECT album_id FROM tracks WHERE missing = 0) ORDER BY title COLLATE NOCASE",
+            )?
+            .query_map([], |r| {
+                let palette: Option<String> = r.get(5)?;
+                Ok(Album {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    artist: r.get(2)?,
+                    year: r.get(3)?,
+                    cover: r.get(4)?,
+                    palette: palette.and_then(|p| serde_json::from_str(&p).ok()),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(conn);
+        Ok(Library { tracks, albums, playlists: self.playlists()? })
+    }
+
+    pub fn playlists(&self) -> rusqlite::Result<Vec<Playlist>> {
+        let conn = self.conn();
+        let mut playlists = conn
+            .prepare("SELECT id, name, created_at FROM playlists ORDER BY created_at, id")?
+            .query_map([], |r| {
+                Ok(Playlist { id: r.get(0)?, name: r.get(1)?, created_at: r.get(2)?, track_ids: vec![] })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut stmt = conn.prepare("SELECT track_id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position")?;
+        for p in &mut playlists {
+            p.track_ids = stmt.query_map([p.id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        }
+        Ok(playlists)
+    }
+
+    /// Returns the stored mtime for a fully-scanned path, used to skip unchanged files on re-import.
+    pub fn track_mtime(&self, path: &str) -> rusqlite::Result<Option<i64>> {
+        self.conn()
+            .query_row("SELECT mtime FROM tracks WHERE path = ? AND format IS NOT NULL", [path], |r| r.get(0))
+            .optional()
+    }
+
+    /// Tracks imported before format detection existed.
+    pub fn tracks_missing_audio_info(&self) -> rusqlite::Result<Vec<(i64, String)>> {
+        self.conn()
+            .prepare("SELECT id, path FROM tracks WHERE format IS NULL")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect()
+    }
+
+    pub fn set_audio_info(&self, id: i64, a: &AudioInfo) -> rusqlite::Result<()> {
+        self.conn().execute(
+            "UPDATE tracks SET format = ?1, sample_rate = ?2, bit_depth = ?3, bitrate = ?4, channels = ?5, size = ?6
+             WHERE id = ?7",
+            params![a.format, a.sample_rate, a.bit_depth, a.bitrate, a.channels, a.size, id],
+        )?;
+        Ok(())
+    }
+
+    /// Inserts or updates a track and its album. Returns (album_id, album_has_cover).
+    pub fn upsert_track(&self, m: &TrackMeta) -> rusqlite::Result<(i64, bool)> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO albums (title, artist, year) VALUES (?1, ?2, ?3)",
+            params![m.album, m.album_artist, m.year],
+        )?;
+        let (album_id, cover): (i64, Option<String>) = tx.query_row(
+            "SELECT id, cover FROM albums WHERE title = ?1 AND artist = ?2",
+            params![m.album, m.album_artist],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if m.year.is_some() {
+            tx.execute("UPDATE albums SET year = ?1 WHERE id = ?2 AND year IS NULL", params![m.year, album_id])?;
+        }
+        // A file we've never seen at this path may be a missing track that was moved. Re-point the
+        // old row instead of adding a new one, so its lyrics offset, history and playlists carry over.
+        let known: bool = tx.query_row("SELECT COUNT(*) > 0 FROM tracks WHERE path = ?", [&m.path], |r| r.get(0))?;
+        if !known {
+            let moved: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM tracks WHERE missing = 1 AND title = ?1 AND artist = ?2 AND album_id = ?3
+                       AND abs(duration - ?4) < 1.5 LIMIT 1",
+                    params![m.title, m.artist, album_id, m.duration],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(id) = moved {
+                tx.execute("UPDATE tracks SET path = ?1, missing = 0 WHERE id = ?2", params![m.path, id])?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO tracks (path, title, artist, album_id, track_no, disc_no, duration, genre, mtime, added_at,
+               format, sample_rate, bit_depth, bitrate, channels, size, loudness, peak)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+             ON CONFLICT(path) DO UPDATE SET title = excluded.title, artist = excluded.artist,
+               album_id = excluded.album_id, track_no = excluded.track_no, disc_no = excluded.disc_no,
+               duration = excluded.duration, genre = excluded.genre, mtime = excluded.mtime,
+               format = excluded.format, sample_rate = excluded.sample_rate, bit_depth = excluded.bit_depth,
+               bitrate = excluded.bitrate, channels = excluded.channels, size = excluded.size,
+               loudness = excluded.loudness, peak = excluded.peak, missing = 0",
+            params![
+                m.path, m.title, m.artist, album_id, m.track_no, m.disc_no, m.duration, m.genre, m.mtime,
+                now(), m.audio.format, m.audio.sample_rate, m.audio.bit_depth, m.audio.bitrate,
+                m.audio.channels, m.audio.size, m.loudness, m.peak
+            ],
+        )?;
+        tx.commit()?;
+        Ok((album_id, cover.is_some()))
+    }
+
+    pub fn album_covers(&self) -> rusqlite::Result<Vec<(i64, String)>> {
+        self.conn()
+            .prepare("SELECT id, cover FROM albums WHERE cover IS NOT NULL")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect()
+    }
+
+    pub fn set_album_cover(&self, album_id: i64, cover: &str, palette: &Palette) -> rusqlite::Result<()> {
+        self.conn().execute(
+            "UPDATE albums SET cover = ?1, palette = ?2 WHERE id = ?3",
+            params![cover, serde_json::to_string(palette).ok(), album_id],
+        )?;
+        Ok(())
+    }
+
+    /// Removes tracks and any albums left empty. Returns cover files that are no longer referenced.
+    pub fn remove_tracks(&self, ids: &[i64]) -> rusqlite::Result<Vec<String>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM tracks WHERE id = ?")?;
+            for id in ids {
+                stmt.execute([id])?;
+            }
+        }
+        let covers = cleanup_albums(&tx)?;
+        tx.commit()?;
+        Ok(covers)
+    }
+
+    /// Deletes albums with no tracks left (e.g. after re-tagging). Returns their cover files.
+    pub fn cleanup_albums(&self) -> rusqlite::Result<Vec<String>> {
+        self.remove_tracks(&[])
+    }
+
+    /// Flags tracks whose files are gone (and un-flags ones that are back). Never deletes: a moved
+    /// or temporarily unavailable file must not cost the user their lyrics offsets, history or
+    /// playlists. Returns true if anything changed.
+    pub fn mark_missing(&self) -> rusqlite::Result<bool> {
+        let rows: Vec<(i64, String, bool)> = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare("SELECT id, path, missing FROM tracks")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let changes: Vec<(i64, bool)> = rows
+            .into_iter()
+            .filter_map(|(id, path, was_missing)| {
+                let now_missing = !Path::new(&path).exists();
+                (now_missing != was_missing).then_some((id, now_missing))
+            })
+            .collect();
+        if changes.is_empty() {
+            return Ok(false);
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE tracks SET missing = ?1 WHERE id = ?2")?;
+            for (id, missing) in &changes {
+                stmt.execute(params![missing, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Folds missing tracks into an identical song that is present elsewhere (the file was moved and
+    /// re-imported before the old copy was flagged), carrying over history, playlist entries,
+    /// lyrics and the lyrics offset. Returns how many were merged.
+    pub fn merge_moved(&self) -> rusqlite::Result<usize> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let pairs: Vec<(i64, i64)> = tx
+            .prepare(
+                "SELECT m.id, (SELECT v.id FROM tracks v WHERE v.missing = 0 AND v.title = m.title
+                   AND v.artist = m.artist AND v.album_id = m.album_id AND abs(v.duration - m.duration) < 1.5
+                   ORDER BY v.id LIMIT 1) AS target
+                 FROM tracks m WHERE m.missing = 1 AND target IS NOT NULL",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (old, new) in &pairs {
+            tx.execute("UPDATE plays SET track_id = ?1 WHERE track_id = ?2", params![new, old])?;
+            tx.execute("UPDATE playlist_tracks SET track_id = ?1 WHERE track_id = ?2", params![new, old])?;
+            tx.execute(
+                "INSERT OR IGNORE INTO lyrics (track_id, synced, plain, instrumental, source, fetched_at, offset_ms)
+                 SELECT ?1, synced, plain, instrumental, source, fetched_at, offset_ms FROM lyrics WHERE track_id = ?2",
+                params![new, old],
+            )?;
+            tx.execute(
+                "UPDATE lyrics SET offset_ms = (SELECT offset_ms FROM lyrics WHERE track_id = ?2)
+                 WHERE track_id = ?1 AND offset_ms = 0 AND EXISTS (SELECT 1 FROM lyrics WHERE track_id = ?2)",
+                params![new, old],
+            )?;
+            tx.execute("DELETE FROM tracks WHERE id = ?", [old])?;
+        }
+        tx.commit()?;
+        Ok(pairs.len())
+    }
+
+    pub fn queue_sources(&self, ids: &[i64]) -> rusqlite::Result<Vec<QueueSource>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached("SELECT path, duration, loudness, peak FROM tracks WHERE id = ?")?;
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(src) = stmt
+                .query_row([id], |r| {
+                    Ok(QueueSource { id, path: r.get(0)?, duration: r.get(1)?, loudness: r.get(2)?, peak: r.get(3)? })
+                })
+                .optional()?
+            {
+                out.push(src);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Tracks still needing a loudness measurement, in the order given (queue first), then the rest.
+    pub fn tracks_missing_loudness(&self, limit: usize) -> rusqlite::Result<Vec<(i64, String)>> {
+        self.conn()
+            .prepare("SELECT id, path FROM tracks WHERE loudness IS NULL AND missing = 0 ORDER BY added_at DESC LIMIT ?")?
+            .query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect()
+    }
+
+    pub fn track_path(&self, id: i64) -> Option<(String, bool)> {
+        self.conn()
+            .query_row("SELECT path, loudness IS NOT NULL FROM tracks WHERE id = ?", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Stores a measurement. Silent/undecodable files get a sentinel so they aren't retried forever.
+    pub fn set_loudness(&self, id: i64, lufs: f64, peak: f64) -> rusqlite::Result<()> {
+        self.conn().execute("UPDATE tracks SET loudness = ?1, peak = ?2 WHERE id = ?3", params![lufs, peak, id])?;
+        Ok(())
+    }
+
+    pub fn record_play(&self, track_id: i64) -> rusqlite::Result<()> {
+        self.conn().execute("INSERT INTO plays (track_id, played_at) VALUES (?1, ?2)", params![track_id, now()])?;
+        Ok(())
+    }
+
+    pub fn history(&self) -> rusqlite::Result<History> {
+        let conn = self.conn();
+        let recent_albums = conn
+            .prepare(
+                "SELECT t.album_id FROM plays p JOIN tracks t ON t.id = p.track_id WHERE t.missing = 0
+                 GROUP BY t.album_id ORDER BY MAX(p.played_at) DESC LIMIT 12",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let recent_tracks = conn
+            .prepare(
+                "SELECT p.track_id FROM plays p JOIN tracks t ON t.id = p.track_id WHERE t.missing = 0
+                 GROUP BY p.track_id ORDER BY MAX(p.played_at) DESC LIMIT 20",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let top_tracks = conn
+            .prepare(
+                "SELECT p.track_id, COUNT(*) AS n FROM plays p JOIN tracks t ON t.id = p.track_id
+                 WHERE p.played_at > ? AND t.missing = 0
+                 GROUP BY p.track_id ORDER BY n DESC, MAX(p.played_at) DESC LIMIT 10",
+            )?
+            .query_map([now() - 90 * 24 * 3600], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(History { recent_albums, recent_tracks, top_tracks })
+    }
+
+    pub fn playlist_create(&self, name: &str) -> rusqlite::Result<Playlist> {
+        let conn = self.conn();
+        let created_at = now();
+        conn.execute("INSERT INTO playlists (name, created_at) VALUES (?1, ?2)", params![name, created_at])?;
+        Ok(Playlist { id: conn.last_insert_rowid(), name: name.into(), created_at, track_ids: vec![] })
+    }
+
+    pub fn playlist_rename(&self, id: i64, name: &str) -> rusqlite::Result<()> {
+        self.conn().execute("UPDATE playlists SET name = ?1 WHERE id = ?2", params![name, id])?;
+        Ok(())
+    }
+
+    pub fn playlist_delete(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn().execute("DELETE FROM playlists WHERE id = ?", [id])?;
+        Ok(())
+    }
+
+    pub fn playlist_set_tracks(&self, id: i64, track_ids: &[i64]) -> rusqlite::Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?", [id])?;
+        {
+            let mut stmt =
+                tx.prepare("INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (?1, ?2, ?3)")?;
+            for (pos, tid) in track_ids.iter().enumerate() {
+                stmt.execute(params![id, tid, pos as i64])?;
+            }
+        }
+        tx.commit()
+    }
+
+    pub fn playlist_add_tracks(&self, id: i64, track_ids: &[i64]) -> rusqlite::Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let start: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(position) + 1, 0) FROM playlist_tracks WHERE playlist_id = ?",
+            [id],
+            |r| r.get(0),
+        )?;
+        {
+            let mut stmt =
+                tx.prepare("INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (?1, ?2, ?3)")?;
+            for (i, tid) in track_ids.iter().enumerate() {
+                stmt.execute(params![id, tid, start + i as i64])?;
+            }
+        }
+        tx.commit()
+    }
+
+    pub fn now_playing_info(&self, id: i64) -> rusqlite::Result<Option<NowPlayingInfo>> {
+        self.conn()
+            .query_row(
+                "SELECT t.title, t.artist, a.title, a.cover, t.duration
+                 FROM tracks t JOIN albums a ON a.id = t.album_id WHERE t.id = ?",
+                [id],
+                |r| {
+                    Ok(NowPlayingInfo {
+                        title: r.get(0)?,
+                        artist: r.get(1)?,
+                        album: r.get(2)?,
+                        cover: r.get(3)?,
+                        duration: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    pub fn lyrics_query(&self, id: i64) -> rusqlite::Result<Option<LyricsQuery>> {
+        self.conn()
+            .query_row(
+                "SELECT t.path, t.title, t.artist, a.title, t.duration
+                 FROM tracks t JOIN albums a ON a.id = t.album_id WHERE t.id = ?",
+                [id],
+                |r| {
+                    Ok(LyricsQuery {
+                        path: r.get(0)?,
+                        title: r.get(1)?,
+                        artist: r.get(2)?,
+                        album: r.get(3)?,
+                        duration: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Cached lyrics and when they were fetched.
+    pub fn cached_lyrics(&self, id: i64) -> Option<(Lyrics, i64)> {
+        self.conn()
+            .query_row(
+                "SELECT synced, plain, instrumental, source, fetched_at, offset_ms FROM lyrics WHERE track_id = ?",
+                [id],
+                |r| {
+                    Ok((
+                        Lyrics {
+                            synced: r.get(0)?,
+                            plain: r.get(1)?,
+                            instrumental: r.get(2)?,
+                            source: r.get(3)?,
+                            offset_ms: r.get(5)?,
+                        },
+                        r.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn save_lyrics(&self, id: i64, l: &Lyrics) -> rusqlite::Result<()> {
+        self.conn().execute(
+            "INSERT INTO lyrics (track_id, synced, plain, instrumental, source, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(track_id) DO UPDATE SET synced = excluded.synced, plain = excluded.plain,
+               instrumental = excluded.instrumental, source = excluded.source, fetched_at = excluded.fetched_at",
+            params![id, l.synced, l.plain, l.instrumental, l.source, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Per-track lyric timing correction. Creates a placeholder row for local `.lrc` lyrics.
+    pub fn set_lyrics_offset(&self, id: i64, offset_ms: i64) -> rusqlite::Result<()> {
+        self.conn().execute(
+            "INSERT INTO lyrics (track_id, instrumental, source, fetched_at, offset_ms) VALUES (?1, 0, 'none', 0, ?2)
+             ON CONFLICT(track_id) DO UPDATE SET offset_ms = excluded.offset_ms",
+            params![id, offset_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn lyrics_offset(&self, id: i64) -> i64 {
+        self.conn()
+            .query_row("SELECT offset_ms FROM lyrics WHERE track_id = ?", [id], |r| r.get(0))
+            .unwrap_or(0)
+    }
+
+    pub fn setting(&self, key: &str) -> Option<String> {
+        self.conn()
+            .query_row("SELECT value FROM settings WHERE key = ?", [key], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        self.conn().execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+}
+
+fn cleanup_albums(tx: &rusqlite::Transaction) -> rusqlite::Result<Vec<String>> {
+    let covers = tx
+        .prepare("SELECT cover FROM albums WHERE cover IS NOT NULL AND id NOT IN (SELECT album_id FROM tracks)")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    tx.execute("DELETE FROM albums WHERE id NOT IN (SELECT album_id FROM tracks)", [])?;
+    Ok(covers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(path: &str) -> TrackMeta {
+        TrackMeta {
+            path: path.into(),
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            album_artist: "Artist".into(),
+            track_no: Some(1),
+            disc_no: None,
+            year: None,
+            duration: 180.0,
+            genre: None,
+            mtime: 1,
+            audio: AudioInfo::default(),
+            loudness: None,
+            peak: None,
+        }
+    }
+
+    #[test]
+    fn moved_files_keep_their_row_and_offset() {
+        let dir = std::env::temp_dir().join(format!("reson-dbtest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("old.flac");
+        std::fs::write(&old, b"x").unwrap();
+        let db = Db::open(&dir.join("t.db")).unwrap();
+
+        db.upsert_track(&meta(&old.to_string_lossy())).unwrap();
+        let id = db.library().unwrap().tracks[0].id;
+        db.set_lyrics_offset(id, 750).unwrap();
+
+        // The file moves away: hidden, not deleted.
+        std::fs::remove_file(&old).unwrap();
+        assert!(db.mark_missing().unwrap());
+        assert!(db.library().unwrap().tracks.is_empty());
+        assert_eq!(db.lyrics_offset(id), 750);
+
+        // It shows up somewhere else: the same row comes back with its offset.
+        let new = dir.join("new.flac");
+        std::fs::write(&new, b"x").unwrap();
+        db.upsert_track(&meta(&new.to_string_lossy())).unwrap();
+        let lib = db.library().unwrap();
+        assert_eq!(lib.tracks.len(), 1);
+        assert_eq!(lib.tracks[0].id, id);
+        assert_eq!(lib.tracks[0].path, new.to_string_lossy());
+        assert_eq!(db.lyrics_offset(id), 750);
+        assert!(!db.mark_missing().unwrap());
+
+        // Re-imported from a new folder while the old file was still flagged present: merged later.
+        let third = dir.join("third.flac");
+        std::fs::write(&third, b"x").unwrap();
+        db.upsert_track(&meta(&third.to_string_lossy())).unwrap();
+        assert_eq!(db.library().unwrap().tracks.len(), 2);
+        db.record_play(id).unwrap();
+        std::fs::remove_file(&new).unwrap();
+        db.mark_missing().unwrap();
+        assert_eq!(db.merge_moved().unwrap(), 1);
+        let lib = db.library().unwrap();
+        assert_eq!(lib.tracks.len(), 1);
+        let survivor = lib.tracks[0].id;
+        assert_eq!(db.lyrics_offset(survivor), 750);
+        assert_eq!(db.history().unwrap().recent_tracks, vec![survivor]);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

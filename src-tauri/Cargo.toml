@@ -1,0 +1,47 @@
+[package]
+name = "reson"
+version = "0.1.0"
+description = "Reson, a Rust-powered music player"
+license = "MIT"
+repository = "https://github.com/osfv/Reson"
+edition = "2021"
+rust-version = "1.90"
+
+[lib]
+name = "reson_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "~2.6.3", features = [] }
+
+[dependencies]
+tauri = { version = "~2.11.6", features = ["protocol-asset", "tray-icon"] }
+tauri-plugin-dialog = "~2.7.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+lofty = "0.25.4"
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "flac", "mp3", "mp4", "vorbis", "wav"] }
+# rodio decodes via symphonia's default registry; enabling ALAC here makes Apple Lossless .m4a playable.
+symphonia = { version = "0.5.5", default-features = false, features = ["alac"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif"] }
+walkdir = "2.5"
+ureq = { version = "3.4.2", features = ["json"] }
+souvlaki = "0.8.3"
+tauri-plugin-window-state = "~2.4.1"
+notify = "8.2.0"
+sha2 = "0.10.9"
+serde_norway = "0.9.42"
+fastrand = "2.3"
+
+# Decoding and per-sample DSP must be fast even in dev builds or playback can stutter.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
