@@ -15,7 +15,7 @@ from the album art of whatever you're listening to.
 
 **[Download for Windows](https://github.com/osfv/Reson/releases/latest)**
 
-<img src="docs/screenshots/lyrics.png" alt="Now Playing with synced lyrics" width="860">
+<img src="docs/demo.webp" alt="Reson skipping through a playlist: Now Playing recolors from each cover while synced lyrics scroll along" width="860">
 
 </div>
 
@@ -33,10 +33,12 @@ No account, no server, no streaming. Point Reson at a folder of FLACs or MP3s an
     <td align="center"><sub>Now Playing takes its colors from the cover</sub></td>
   </tr>
   <tr>
-    <td colspan="2"><img src="docs/screenshots/lyrics-theme.png" alt="Synced lyrics with depth blur on a purple theme"></td>
+    <td width="50%"><img src="docs/screenshots/lyrics.png" alt="Synced lyrics next to the cover in Now Playing"></td>
+    <td width="50%"><img src="docs/screenshots/lyrics-theme.png" alt="Synced lyrics with depth blur on a purple theme"></td>
   </tr>
   <tr>
-    <td colspan="2" align="center"><sub>Synced lyrics from LRCLIB, with karaoke fill on the current line and depth blur on the rest</sub></td>
+    <td align="center"><sub>Synced lyrics from LRCLIB, with karaoke fill on the current line</sub></td>
+    <td align="center"><sub>Lines away from the current one soften with depth blur</sub></td>
   </tr>
 </table>
 
