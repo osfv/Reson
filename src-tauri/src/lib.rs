@@ -133,6 +133,11 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 
 pub fn run() {
     tauri::Builder::default()
+        // Must be registered first. Launching Reson again (e.g. from the Start menu while it sits in the
+        // tray) brings the running window back instead of starting a second player.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            let _ = set_mini_player(app, false);
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_window_state::Builder::default()

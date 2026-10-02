@@ -32,7 +32,20 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis", "msi"],
+    "publisher": "osfv",
+    "homepage": "https://github.com/osfv/Reson",
+    "copyright": "Copyright (c) 2026 osfv. MIT License.",
+    "category": "Music",
+    "shortDescription": "A desktop music player for the files you own",
+    "longDescription": "Reson plays your local music library with album-art theming, synced lyrics from LRCLIB, gapless playback, crossfade and loudness normalization.",
+    "license": "MIT",
+    "licenseFile": "../LICENSE",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

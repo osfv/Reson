@@ -26,6 +26,10 @@ pub struct MediaSession {
 
 impl MediaSession {
     pub fn new(hwnd: Option<isize>, tx: Sender<Cmd>) -> Option<Self> {
+        // souvlaki panics (taking the audio thread down with it) instead of erroring without a window.
+        if cfg!(windows) && hwnd.is_none() {
+            return None;
+        }
         let config = PlatformConfig {
             display_name: "Reson",
             dbus_name: "reson",
