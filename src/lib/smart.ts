@@ -103,6 +103,8 @@ export function problem(rules: SmartRules): string | null {
   for (const r of rules.rules) {
     if (FIELDS[r.field].kind === "text" && typeof r.value === "string" && !r.value.trim())
       return `Type something for ${FIELDS[r.field].label.toLowerCase()}.`;
+    const nums = Array.isArray(r.value) ? r.value : typeof r.value === "number" ? [r.value] : [];
+    if (nums.some((n) => !Number.isFinite(n))) return `Enter a number for ${FIELDS[r.field].label.toLowerCase()}.`;
   }
   if (rules.limit != null && (!Number.isFinite(rules.limit) || rules.limit < 1)) return "The limit must be at least 1.";
   return null;
