@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::lyrics::{Lyrics, LyricsQuery};
 use crate::media::NowPlayingInfo;
 use crate::palette::Palette;
+use crate::smart::{self, Rules};
 
 pub struct Db(Mutex<Connection>);
 
@@ -62,11 +63,24 @@ pub struct Playlist {
     pub track_ids: Vec<i64>,
 }
 
+/// A rule-based playlist. `track_ids` is evaluated from the rules on every read.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartPlaylist {
+    pub id: i64,
+    pub name: String,
+    pub created_at: i64,
+    pub rules: Rules,
+    pub track_ids: Vec<i64>,
+}
+
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Library {
     pub tracks: Vec<Track>,
     pub albums: Vec<Album>,
     pub playlists: Vec<Playlist>,
+    pub smart_playlists: Vec<SmartPlaylist>,
 }
 
 /// Fields read from a file's tags, ready to be written to the library.
@@ -183,6 +197,13 @@ CREATE TABLE IF NOT EXISTS plays (
   played_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS plays_time ON plays(played_at);
+-- Smart playlists store their definition (smart::Rules as JSON), never their tracks.
+CREATE TABLE IF NOT EXISTS smart_playlists (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  rules TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -261,7 +282,7 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(conn);
-        Ok(Library { tracks, albums, playlists: self.playlists()? })
+        Ok(Library { tracks, albums, playlists: self.playlists()?, smart_playlists: self.smart_playlists()? })
     }
 
     pub fn playlists(&self) -> rusqlite::Result<Vec<Playlist>> {
@@ -277,6 +298,84 @@ impl Db {
             p.track_ids = stmt.query_map([p.id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         }
         Ok(playlists)
+    }
+
+    /// Track ids matching `rules`, in playlist order.
+    pub fn smart_tracks(&self, rules: &Rules) -> Result<Vec<i64>, String> {
+        let (sql, params) = rules.compile(now())?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+        let ids = stmt
+            .query_map(rusqlite::params_from_iter(params), |r| r.get(0))
+            .and_then(|rows| rows.collect::<rusqlite::Result<_>>())
+            .map_err(|e| e.to_string())?;
+        Ok(ids)
+    }
+
+    /// All smart playlists with their current tracks. Definitions this version can't read (e.g. written
+    /// by a newer Reson) are skipped rather than failing the whole library.
+    pub fn smart_playlists(&self) -> rusqlite::Result<Vec<SmartPlaylist>> {
+        let rows: Vec<(i64, String, String, i64)> = self
+            .conn()
+            .prepare("SELECT id, name, rules, created_at FROM smart_playlists ORDER BY created_at, id")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, name, json, created_at)| {
+                let rules: Rules = serde_json::from_str(&json).ok()?;
+                let track_ids = self.smart_tracks(&rules).unwrap_or_default();
+                Some(SmartPlaylist { id, name, created_at, rules, track_ids })
+            })
+            .collect())
+    }
+
+    pub fn smart_create(&self, name: &str, rules: &Rules) -> Result<SmartPlaylist, String> {
+        rules.validate()?;
+        let json = serde_json::to_string(rules).map_err(|e| e.to_string())?;
+        let created_at = now();
+        let id = {
+            let conn = self.conn();
+            conn.execute(
+                "INSERT INTO smart_playlists (name, rules, created_at) VALUES (?1, ?2, ?3)",
+                params![name, json, created_at],
+            )
+            .map_err(|e| e.to_string())?;
+            conn.last_insert_rowid()
+        };
+        let track_ids = self.smart_tracks(rules)?;
+        Ok(SmartPlaylist { id, name: name.into(), created_at, rules: rules.clone(), track_ids })
+    }
+
+    pub fn smart_update(&self, id: i64, name: &str, rules: &Rules) -> Result<(), String> {
+        rules.validate()?;
+        let json = serde_json::to_string(rules).map_err(|e| e.to_string())?;
+        self.conn()
+            .execute("UPDATE smart_playlists SET name = ?1, rules = ?2 WHERE id = ?3", params![name, json, id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn smart_delete(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn().execute("DELETE FROM smart_playlists WHERE id = ?", [id])?;
+        Ok(())
+    }
+
+    /// Adds the suggested smart playlists the user doesn't already have (matched by name).
+    pub fn smart_add_defaults(&self) -> Result<usize, String> {
+        let existing: Vec<String> = self
+            .conn()
+            .prepare("SELECT name FROM smart_playlists")
+            .and_then(|mut s| s.query_map([], |r| r.get(0))?.collect())
+            .map_err(|e| e.to_string())?;
+        let mut added = 0;
+        for (name, rules) in smart::defaults() {
+            if !existing.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                self.smart_create(name, &rules)?;
+                added += 1;
+            }
+        }
+        Ok(added)
     }
 
     /// Returns the stored mtime for a fully-scanned path, used to skip unchanged files on re-import.
@@ -673,6 +772,11 @@ impl Db {
             .flatten()
     }
 
+    #[cfg(test)]
+    pub fn exec_for_test(&self, sql: &str) {
+        self.conn().execute_batch(sql).unwrap();
+    }
+
     pub fn set_setting(&self, key: &str, value: &str) -> rusqlite::Result<()> {
         self.conn().execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -712,6 +816,56 @@ mod tests {
             loudness: None,
             peak: None,
         }
+    }
+
+    #[test]
+    fn opening_an_older_database_adds_smart_playlists_and_keeps_data() {
+        let dir = std::env::temp_dir().join(format!("reson-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            // The v0.1.0 layout: no smart_playlists table and none of the later track columns.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE albums (id INTEGER PRIMARY KEY, title TEXT NOT NULL, artist TEXT NOT NULL, year INTEGER,
+                   cover TEXT, palette TEXT, UNIQUE (title, artist));
+                 CREATE TABLE tracks (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
+                   artist TEXT NOT NULL, album_id INTEGER NOT NULL REFERENCES albums(id), track_no INTEGER,
+                   disc_no INTEGER, duration REAL NOT NULL, genre TEXT, mtime INTEGER NOT NULL, added_at INTEGER NOT NULL);
+                 CREATE TABLE playlists (id INTEGER PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL);
+                 CREATE TABLE playlist_tracks (playlist_id INTEGER NOT NULL, track_id INTEGER NOT NULL, position INTEGER NOT NULL);
+                 CREATE TABLE plays (track_id INTEGER NOT NULL, played_at INTEGER NOT NULL);
+                 INSERT INTO albums (id, title, artist, year) VALUES (1, 'Album', 'Artist', 2001);
+                 INSERT INTO tracks VALUES (1, 'x.flac', 'Song', 'Artist', 1, 1, 1, 180, NULL, 1, 1);
+                 INSERT INTO playlists VALUES (1, 'Mine', 1);
+                 INSERT INTO playlist_tracks VALUES (1, 1, 0);
+                 INSERT INTO plays VALUES (1, 5), (1, 6);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let lib = db.library().unwrap();
+        assert_eq!(lib.tracks.len(), 1);
+        assert_eq!(lib.playlists[0].track_ids, vec![1]);
+        assert!(lib.smart_playlists.is_empty());
+
+        let rules: Rules = serde_json::from_str(
+            r#"{"match":"all","rules":[{"field":"plays","op":"gt","value":1},{"field":"year","op":"is","value":2001}]}"#,
+        )
+        .unwrap();
+        let created = db.smart_create("Played", &rules).unwrap();
+        assert_eq!(created.track_ids, vec![1]);
+        drop(db);
+
+        // Reopening is a no-op migration and the definition survives.
+        let db = Db::open(&path).unwrap();
+        let smart = db.smart_playlists().unwrap();
+        assert_eq!(smart.len(), 1);
+        assert_eq!(smart[0].rules, rules);
+        assert_eq!(smart[0].track_ids, vec![1]);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

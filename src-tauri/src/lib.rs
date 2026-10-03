@@ -8,6 +8,7 @@ mod lyrics;
 mod media;
 mod palette;
 mod player;
+mod smart;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -229,6 +230,12 @@ pub fn run() {
             commands::playlist_delete,
             commands::playlist_set_tracks,
             commands::playlist_add_tracks,
+            commands::smart_playlists_get,
+            commands::smart_preview,
+            commands::smart_create,
+            commands::smart_update,
+            commands::smart_delete,
+            commands::smart_add_defaults,
             commands::lyrics_get,
             commands::lyrics_search,
             commands::lyrics_choose,

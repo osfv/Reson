@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api, type Album, type Library, type Playlist, type ScanProgress, type Track } from "../lib/api";
+import { api, type Album, type Library, type Playlist, type ScanProgress, type SmartPlaylist, type Track } from "../lib/api";
 
 export interface Artist {
   name: string;
@@ -13,6 +13,7 @@ interface LibraryState {
   tracks: Track[];
   albums: Album[];
   playlists: Playlist[];
+  smartPlaylists: SmartPlaylist[];
   trackById: Map<number, Track>;
   albumById: Map<number, Album>;
   albumTracks: Map<number, Track[]>;
@@ -22,6 +23,9 @@ interface LibraryState {
   refresh: () => Promise<void>;
   setScan: (scan: ScanProgress) => void;
   setPlaylists: (fn: (p: Playlist[]) => Playlist[]) => void;
+  setSmartPlaylists: (list: SmartPlaylist[]) => void;
+  /** Re-evaluates smart playlists only, e.g. after a play changes play counts. */
+  refreshSmart: () => void;
 }
 
 const byDiscTrack = (a: Track, b: Track) =>
@@ -60,6 +64,7 @@ export const useLibrary = create<LibraryState>((set) => ({
   tracks: [],
   albums: [],
   playlists: [],
+  smartPlaylists: [],
   trackById: new Map(),
   albumById: new Map(),
   albumTracks: new Map(),
@@ -69,13 +74,20 @@ export const useLibrary = create<LibraryState>((set) => ({
   refresh: async () => {
     try {
       const lib = await api.library();
-      set({ loaded: true, error: null, tracks: lib.tracks, albums: lib.albums, playlists: lib.playlists, ...index(lib) });
+      set({ loaded: true, error: null, tracks: lib.tracks, albums: lib.albums, playlists: lib.playlists, smartPlaylists: lib.smartPlaylists, ...index(lib) });
     } catch (e) {
       set({ loaded: true, error: String(e) });
     }
   },
   setScan: (scan) => set({ scan }),
   setPlaylists: (fn) => set((s) => ({ playlists: fn(s.playlists) })),
+  setSmartPlaylists: (smartPlaylists) => set({ smartPlaylists }),
+  refreshSmart: () => {
+    api
+      .smartPlaylists()
+      .then((smartPlaylists) => set({ smartPlaylists }))
+      .catch(() => {});
+  },
 }));
 
 export const albumCovers = (tracks: Track[], albumById: Map<number, Album>, max = 4): Album[] => {

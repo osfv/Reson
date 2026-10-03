@@ -29,7 +29,10 @@ export function useBridge(onDragChange?: (over: boolean) => void) {
       ),
       listen<Spectrum>("player:spectrum", (e) => onSpectrum(e.payload)),
       listen<string>("player:error", (e) => ui.toast(e.payload)),
-      listen("history:changed", () => useHistory.getState().refresh()),
+      listen("history:changed", () => {
+        useHistory.getState().refresh();
+        useLibrary.getState().refreshSmart();
+      }),
       listen<ScanProgress>("library:scan", (e) => {
         useLibrary.getState().setScan(e.payload);
         if (!e.payload.active && onDragChange) {
