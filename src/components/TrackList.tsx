@@ -38,6 +38,8 @@ interface TrackListProps {
   playlistId?: number;
   /** Enables drag-to-reorder (playlists). */
   onMove?: (from: number, to: number) => void;
+  /** Playlist position of each row, when rows are a filtered view of the playlist. */
+  positions?: number[];
 }
 
 export function Equalizer({ paused }: { paused?: boolean }) {
@@ -167,7 +169,7 @@ const Row = memo(function Row({
   );
 });
 
-export function TrackList({ tracks, variant = "library", playlistId, onMove }: TrackListProps) {
+export function TrackList({ tracks, variant = "library", playlistId, positions, onMove }: TrackListProps) {
   const scrollRef = useContext(ScrollContext);
   const listRef = useRef<HTMLDivElement>(null);
   const [offset, setOffset] = useState(0);
@@ -229,7 +231,7 @@ export function TrackList({ tracks, variant = "library", playlistId, onMove }: T
       e.clientY,
       trackMenu(
         rows.map((r) => tracks[r].id),
-        { playlistId, positions: playlistId != null ? rows : undefined },
+        { playlistId, positions: playlistId != null ? rows.map((r) => positions?.[r] ?? r) : undefined },
       ),
     );
   };
