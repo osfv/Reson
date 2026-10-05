@@ -70,8 +70,6 @@ export const SORTS: { value: string; label: string; field: SmartField | "random"
 export const sortKey = (sort: SmartRules["sort"]) =>
   sort ? (SORTS.find((s) => s.field === sort.field && s.desc === sort.desc)?.value ?? "default") : "default";
 
-const DAY = 86400;
-
 /** Unix seconds to a yyyy-mm-dd string for date inputs (local time). */
 export function toDateInput(secs: number) {
   const d = new Date(secs * 1000);
@@ -86,7 +84,8 @@ export function defaultValue(field: SmartField, op: SmartOp): SmartRule["value"]
   const info = FIELDS[field];
   if (info.kind === "text") return "";
   if (op === "inLast" || op === "notInLast") return 30;
-  if (op === "before" || op === "after") return Math.floor(Date.now() / 1000 / DAY) * DAY;
+  // Start of today in local time, like a date the user picks.
+  if (op === "before" || op === "after") return fromDateInput(toDateInput(Date.now() / 1000));
   const base = field === "year" ? 2000 : field === "bitDepth" ? 16 : field === "sampleRate" ? 44100 : field === "duration" ? 300 : 0;
   return op === "between" ? [base, base + (info.scale ?? 1) * (field === "year" ? 9 : 10)] : base;
 }

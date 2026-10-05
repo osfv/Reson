@@ -14,6 +14,7 @@ import { Select, SmartRuleRow, fieldClass } from "./SmartRuleRow";
 export function SmartEditor({ id }: { id: number | null }) {
   const existing = useLibrary((s) => (id == null ? undefined : s.smartPlaylists.find((p) => p.id === id)));
   const close = useUi((s) => s.closeSmartEditor);
+  const setCaptureKeys = useUi((s) => s.setCaptureKeys);
   const [name, setName] = useState(existing?.name ?? "");
   const [rules, setRules] = useState<SmartRules>(() => (existing ? structuredClone(existing.rules) : emptyRules()));
   const [matches, setMatches] = useState<number | null>(null);
@@ -42,13 +43,19 @@ export function SmartEditor({ id }: { id: number | null }) {
       clearTimeout(t);
     };
   }, [rules, issue]);
+  // The app's shortcuts stay off while the dialog is open: Space would toggle playback (and swallow
+  // the key) on a focused dropdown or checkbox, and Ctrl+K would jump to the search box behind it.
   useEffect(() => {
+    setCaptureKeys(true);
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") close();
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [close]);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      setCaptureKeys(false);
+    };
+  }, [close, setCaptureKeys]);
 
   const update = (patch: Partial<SmartRules>) => setRules((r) => ({ ...r, ...patch }));
   const save = async () => {
@@ -154,7 +161,7 @@ export function SmartEditor({ id }: { id: number | null }) {
                 min={1}
                 max={10000}
                 disabled={rules.limit == null}
-                value={rules.limit ?? 25}
+                value={rules.limit == null ? 25 : Number.isFinite(rules.limit) ? rules.limit : ""}
                 onChange={(e) => update({ limit: e.target.value === "" ? NaN : Math.round(Number(e.target.value)) })}
                 className={cn(fieldClass, "w-20 font-mono tabular-nums")}
               />

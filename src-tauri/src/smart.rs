@@ -221,7 +221,8 @@ fn condition(rule: &Rule, now: i64) -> Result<(String, Vec<SqlValue>), String> {
                 }
             }
             Op::Before => (format!("{col} < ?"), vec![SqlValue::Integer(num(rule)? as i64)]),
-            Op::After => (format!("{col} > ?"), vec![SqlValue::Integer(num(rule)? as i64)]),
+            // The value is the start of the chosen day; "after" begins on the next one.
+            Op::After => (format!("{col} >= ?"), vec![SqlValue::Integer(num(rule)? as i64 + DAY)]),
             _ => return bad(),
         },
     })
@@ -258,11 +259,8 @@ impl Rules {
             sql.push_str(&format!(" AND ({})", conds.join(joiner)));
         }
         match sort {
-            Some(Sort { field: Field::Random, seed, .. }) => {
-                // Knuth multiplicative hash: a fixed, well-mixed order for a given seed.
-                sql.push_str(" ORDER BY (t.id * 2654435761 + ?) % 4294967296, t.id");
-                params.push(SqlValue::Integer(*seed as i64));
-            }
+            // Shuffled in `finish`, which also applies the limit.
+            Some(Sort { field: Field::Random, .. }) => sql.push_str(" ORDER BY t.id"),
             Some(s) => {
                 let dir = if s.desc { "DESC" } else { "ASC" };
                 let col = s.field.column();
@@ -278,11 +276,36 @@ impl Rules {
             if limit == 0 {
                 return Err("The limit must be at least 1".into());
             }
-            sql.push_str(" LIMIT ?");
-            params.push(SqlValue::Integer(limit.min(MAX_LIMIT) as i64));
+            if self.seed().is_none() {
+                sql.push_str(" LIMIT ?");
+                params.push(SqlValue::Integer(limit.min(MAX_LIMIT) as i64));
+            }
         }
         Ok((sql, params))
     }
+
+    fn seed(&self) -> Option<u32> {
+        self.sort.as_ref().filter(|s| s.field == Field::Random).map(|s| s.seed)
+    }
+
+    /// Puts the ids from the compiled query in their final order: a random sort is shuffled here
+    /// (a stable order per seed), then limited.
+    pub fn finish(&self, mut ids: Vec<i64>) -> Vec<i64> {
+        if let Some(seed) = self.seed() {
+            ids.sort_by_key(|&id| mix(((seed as u64) << 32) ^ id as u64));
+            if let Some(limit) = self.limit {
+                ids.truncate(limit.min(MAX_LIMIT) as usize);
+            }
+        }
+        ids
+    }
+}
+
+/// SplitMix64's finalizer: a bijection, so every seed gives an unrelated order with no ties.
+fn mix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 /// Suggested playlists, added only when the user asks for them.
@@ -472,6 +495,40 @@ mod tests {
         };
         assert_eq!(eval(&f, &shuffled(7)), eval(&f, &shuffled(7)));
         assert_eq!(eval(&f, &shuffled(7)).len(), 3);
+    }
+
+    #[test]
+    fn random_order_is_a_real_shuffle() {
+        let f = fixture("shuffle");
+        for i in 0..36 {
+            f.db.upsert_track(&track(&format!("s{i}.flac"), &format!("Song {i}"), "Many", "Lots", None, None)).unwrap();
+        }
+        let random = |seed, limit| Rules {
+            limit,
+            sort: Some(Sort { field: Field::Random, desc: false, seed }),
+            ..rules(Match::All, vec![])
+        };
+        let (a, b) = (eval(&f, &random(1, None)), eval(&f, &random(2, None)));
+        assert_eq!(sorted(a.clone()), sorted(b.clone()));
+        // A new seed is a new order, not the same order started from another song.
+        let start = b.iter().position(|id| *id == a[0]).unwrap();
+        let rotated: Vec<i64> = b[start..].iter().chain(&b[..start]).copied().collect();
+        assert_ne!(rotated, a);
+        // Neighbours aren't a fixed number of import positions apart.
+        let gaps: std::collections::HashSet<i64> = a.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
+        assert!(gaps.len() > 5, "{gaps:?}");
+        // The limit takes a stable sample of the whole shuffled list.
+        assert_eq!(eval(&f, &random(1, Some(10))), a[..10]);
+    }
+
+    #[test]
+    fn after_a_date_starts_the_next_day() {
+        let f = fixture("after");
+        // a.flac was added 1000 s into day 0, so it's on that day, not after it.
+        let after = rules(Match::All, vec![rule(Field::AddedAt, Op::After, json!(0))]);
+        assert_eq!(sorted(eval(&f, &after)), vec![2, 3, 4]);
+        let before = rules(Match::All, vec![rule(Field::AddedAt, Op::Before, json!(DAY))]);
+        assert_eq!(eval(&f, &before), vec![1]);
     }
 
     #[test]

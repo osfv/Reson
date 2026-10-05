@@ -604,7 +604,7 @@ impl Db {
             .query_map(rusqlite::params_from_iter(params), |r| r.get(0))
             .and_then(|rows| rows.collect::<rusqlite::Result<_>>())
             .map_err(|e| e.to_string())?;
-        Ok(ids)
+        Ok(rules.finish(ids))
     }
 
     /// All smart playlists with their current tracks. Definitions this version can't read (e.g. written
