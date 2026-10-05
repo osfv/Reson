@@ -57,6 +57,12 @@ export function SettingsView() {
         >
           <Toggle label="Normalize volume" checked={prefs.normalize} onChange={(v) => set({ normalize: v })} />
         </Row>
+        <Row
+          title="Autoplay"
+          body="When your queue runs out, keep playing similar songs from your library, starting with the same artists, then the same genres and years. With Repeat on, your queue loops instead."
+        >
+          <Toggle label="Autoplay" checked={prefs.autoplay} onChange={(v) => set({ autoplay: v })} />
+        </Row>
         <OutputSettings />
       </Group>
 

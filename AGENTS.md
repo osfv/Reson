@@ -73,6 +73,10 @@ Verify changes with `npm run typecheck` and `cargo check` at minimum; run `cargo
   `releases/latest/download/latest.json` (Tauri's manifest format), verifies the installer with `minisign-verify`
   against `PUBLIC_KEY`, runs it with `/P /UPDATE /R`, and exits. `tests/fixtures/updater-fixture.txt(.sig)` proves
   the compiled key matches the release key.
+- `src-tauri/src/autoplay.rs`: when the last queue item plays with repeat off, `Engine::autoplay` appends a batch of
+  similar library songs (`Item.auto`, shown under "Autoplay" in the queue) early enough for gapless/crossfade.
+  Scoring is pure (`autoplay::pick`, tested): artist > genre > year, plus liked/plays and jitter, capped per artist and
+  album. "Add to queue" inserts before upcoming autoplay songs. Tried once per queue item unless the user skips.
 - `src-tauri/src/smart.rs`: smart playlists store only their rules (JSON in `smart_playlists.rules`); `Rules::compile`
   turns them into one parameterized query re-run on every library read (and after each play via `history:changed`).
   Random sort is shuffled in Rust (`Rules::finish`, SplitMix64 per seed) because SQL arithmetic hashes only rotate

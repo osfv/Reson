@@ -118,6 +118,8 @@ export type Repeat = "off" | "all" | "one";
 export interface QueueEntry {
   uid: number;
   id: number;
+  /** Added by autoplay after the songs the user picked. */
+  auto: boolean;
 }
 
 export interface PlayerSnapshot {
@@ -216,6 +218,8 @@ export interface Prefs {
   discordAppId: string | null;
   discordCovers: boolean;
   autoUpdate: boolean;
+  /** Keep playing similar songs when the queue runs out. */
+  autoplay: boolean;
 }
 
 export interface AudioDevice {

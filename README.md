@@ -56,6 +56,7 @@ No account, no server, no streaming. Point Reson at a folder of FLACs or MP3s an
 <summary><b>Playback</b></summary>
 
 - Gapless playback and optional crossfade (0 to 12 seconds)
+- Autoplay: when your queue runs out, it keeps going with similar songs from your library
 - Loudness normalization from ReplayGain tags, or measured in the background when a file has none
 - Short fades on pause, resume and seek, so you never hear a pop
 - 10-band equalizer with presets, a live response curve, and [AutoEQ](https://autoeq.app) headphone profiles

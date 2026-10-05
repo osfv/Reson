@@ -1,4 +1,5 @@
 mod analysis;
+mod autoplay;
 mod background;
 mod commands;
 mod db;
@@ -49,6 +50,8 @@ pub struct Prefs {
     /// Look up public cover art so the Discord status can show it.
     pub discord_covers: bool,
     pub auto_update: bool,
+    /// When the queue runs out, keep playing similar songs from the library.
+    pub autoplay: bool,
 }
 
 impl Default for Prefs {
@@ -65,6 +68,7 @@ impl Default for Prefs {
             discord_app_id: None,
             discord_covers: true,
             auto_update: true,
+            autoplay: true,
         }
     }
 }
@@ -77,6 +81,7 @@ impl Prefs {
             eq: self.eq.clone(),
             output_device: self.output_device.clone(),
             exclusive: self.exclusive,
+            autoplay: self.autoplay,
         }
     }
 }

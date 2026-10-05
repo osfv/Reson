@@ -6,6 +6,7 @@
 //! With crossfade enabled, the next track instead gets its own deck that fades in while the old
 //! one fades out. Pause, resume, seek and manual skips use short gain ramps so they never click.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -17,6 +18,7 @@ use rodio::{Player, Source};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::autoplay;
 use crate::db::{now, Db, QueueSource};
 use crate::decode::{self, BoxSource};
 use crate::dsp::{normalization_gain, EqCtl, EqSettings, Master, Processed, Tap, TrackCtl};
@@ -55,11 +57,13 @@ pub struct PlaybackPrefs {
     pub output_device: Option<String>,
     /// WASAPI exclusive mode (bit-perfect when nothing else changes the signal).
     pub exclusive: bool,
+    /// When the queue runs out (repeat off), keep playing similar songs from the library.
+    pub autoplay: bool,
 }
 
 impl Default for PlaybackPrefs {
     fn default() -> Self {
-        Self { crossfade: 0.0, normalize: true, eq: EqSettings::default(), output_device: None, exclusive: false }
+        Self { crossfade: 0.0, normalize: true, eq: EqSettings::default(), output_device: None, exclusive: false, autoplay: true }
     }
 }
 
@@ -101,6 +105,8 @@ pub enum Cmd {
 struct Item {
     uid: u64,
     src: QueueSource,
+    /// Added by autoplay rather than by the user.
+    auto: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -108,6 +114,7 @@ struct Item {
 pub struct QueueEntry {
     uid: u64,
     id: i64,
+    auto: bool,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -140,6 +147,9 @@ struct Saved {
     volume: f32,
     shuffle: bool,
     repeat: Repeat,
+    /// Indices into `ids` that autoplay added.
+    #[serde(default)]
+    auto: Vec<usize>,
 }
 
 pub struct PlayerHandle {
@@ -255,6 +265,8 @@ struct Engine {
     media: Option<MediaSession>,
     /// Track id whose metadata was last pushed to the OS overlay and window title.
     announced: Option<i64>,
+    /// Queue item autoplay last tried to extend the queue after, so it asks the library once.
+    autoplay_tried: Option<u64>,
 }
 
 impl Engine {
@@ -288,6 +300,7 @@ impl Engine {
             last_progress: Instant::now(),
             media: None,
             announced: None,
+            autoplay_tried: None,
         }
     }
 
@@ -296,7 +309,7 @@ impl Engine {
             .into_iter()
             .map(|src| {
                 self.next_uid += 1;
-                Item { uid: self.next_uid, src }
+                Item { uid: self.next_uid, src, auto: false }
             })
             .collect()
     }
@@ -521,6 +534,8 @@ impl Engine {
     }
 
     fn advance(&mut self, manual: bool) {
+        // Skipping past the last song asks again even if the library had nothing earlier.
+        self.autoplay(manual);
         if let Some((idx, play)) = self.next_index(manual) {
             self.start_at(idx, play);
         }
@@ -605,8 +620,44 @@ impl Engine {
     }
 
     fn enqueue(&mut self, sources: Vec<QueueSource>, next: bool) {
-        let at = if next { self.index.map(|i| i + 1).unwrap_or(0) } else { self.queue.len() };
+        let after = self.index.map(|i| i + 1).unwrap_or(0);
+        // "Add to queue" goes before any autoplay songs, which only fill in after what the user picked.
+        let first_auto = self.queue.iter().skip(after).position(|i| i.auto).map(|p| after + p);
+        let at = if next { after } else { first_auto.unwrap_or(self.queue.len()) };
         self.insert(sources, at);
+    }
+
+    /// Autoplay: while the last song plays (repeat off), adds a batch of similar songs from the
+    /// library so playback carries on, gaplessly or crossfaded like any other next song.
+    fn autoplay(&mut self, force: bool) {
+        let Some(idx) = self.index.filter(|i| i + 1 == self.queue.len()) else { return };
+        let uid = Some(self.queue[idx].uid);
+        if !self.prefs.autoplay || self.repeat != Repeat::Off || (!force && self.autoplay_tried == uid) {
+            return;
+        }
+        self.autoplay_tried = uid;
+        // What the user chose steers it; once only autoplay songs are left, they do.
+        let chosen: Vec<i64> = self.queue.iter().rev().filter(|i| !i.auto).take(25).map(|i| i.src.id).collect();
+        let seeds = if chosen.is_empty() { self.queue.iter().rev().take(10).map(|i| i.src.id).collect() } else { chosen };
+        let Ok(candidates) = self.db.autoplay_candidates() else { return };
+        let mut exclude: HashSet<i64> = self.queue.iter().map(|i| i.src.id).collect();
+        exclude.extend(self.db.recent_plays(50).unwrap_or_default());
+        let mut ids = autoplay::pick(&seeds, &candidates, &exclude, autoplay::BATCH, fastrand::f64);
+        if ids.is_empty() {
+            // Everything has been played lately: allow repeats, just not the last few songs.
+            let recent: HashSet<i64> = self.queue.iter().rev().take(10).map(|i| i.src.id).collect();
+            ids = autoplay::pick(&seeds, &candidates, &recent, autoplay::BATCH, fastrand::f64);
+        }
+        let sources = self.db.queue_sources(&ids).unwrap_or_default();
+        if sources.is_empty() {
+            return;
+        }
+        let items: Vec<Item> = self.items(sources).into_iter().map(|i| Item { auto: true, ..i }).collect();
+        if let Some(orig) = &mut self.original {
+            orig.extend(items.iter().cloned());
+        }
+        self.queue.extend(items);
+        self.publish();
     }
 
     fn move_item(&mut self, uid: u64, to: usize) {
@@ -730,6 +781,7 @@ impl Engine {
         if deck.preloaded.is_some() || deck.preload_tried || remaining > PRELOAD_BEFORE || self.duration() <= 0.0 {
             return;
         }
+        self.autoplay(false);
         let Some((idx, true)) = self.next_index(false) else { return };
         let item = self.queue[idx].clone();
         let format = self.device.as_ref().and_then(|d| d.exclusive_format());
@@ -758,6 +810,7 @@ impl Engine {
         if dur < cf * 2.0 + 1.0 || dur - pos > cf || dur - pos < 0.2 {
             return false;
         }
+        self.autoplay(false);
         let Some((idx, true)) = self.next_index(false) else { return false };
         let ms = (cf * 1000.0) as u32;
         if let Some(deck) = self.deck.take() {
@@ -892,7 +945,7 @@ impl Engine {
 
     fn snapshot(&self) -> Snapshot {
         Snapshot {
-            queue: self.queue.iter().map(|i| QueueEntry { uid: i.uid, id: i.src.id }).collect(),
+            queue: self.queue.iter().map(|i| QueueEntry { uid: i.uid, id: i.src.id, auto: i.auto }).collect(),
             index: self.index,
             playing: self.playing,
             volume: self.volume,
@@ -956,6 +1009,7 @@ impl Engine {
             volume: self.volume,
             shuffle: self.shuffle,
             repeat: self.repeat,
+            auto: self.queue.iter().enumerate().filter(|(_, i)| i.auto).map(|(p, _)| p).collect(),
         };
         if let Ok(json) = serde_json::to_string(&saved) {
             let _ = self.db.set_setting(SETTINGS_KEY, &json);
@@ -975,6 +1029,13 @@ impl Engine {
         let sources = self.db.queue_sources(&saved.ids).unwrap_or_default();
         let complete = sources.len() == saved.ids.len();
         self.queue = self.items(sources);
+        if complete {
+            for &p in &saved.auto {
+                if let Some(item) = self.queue.get_mut(p) {
+                    item.auto = true;
+                }
+            }
+        }
         if complete {
             self.original = saved
                 .original

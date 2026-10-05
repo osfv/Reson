@@ -877,6 +877,39 @@ impl Db {
         Ok(out)
     }
 
+    /// Every playable song with what autoplay scores it on.
+    pub fn autoplay_candidates(&self) -> rusqlite::Result<Vec<crate::autoplay::Candidate>> {
+        self.conn()
+            .prepare(
+                "SELECT t.id, t.artist, a.artist, t.album_id, t.genre, a.year, COALESCE(p.n, 0), l.track_id IS NOT NULL
+                 FROM tracks t JOIN albums a ON a.id = t.album_id
+                 LEFT JOIN (SELECT track_id, COUNT(*) AS n FROM plays GROUP BY track_id) p ON p.track_id = t.id
+                 LEFT JOIN likes l ON l.track_id = t.id
+                 WHERE t.missing = 0",
+            )?
+            .query_map([], |r| {
+                Ok(crate::autoplay::Candidate {
+                    id: r.get(0)?,
+                    artist: r.get(1)?,
+                    album_artist: r.get(2)?,
+                    album_id: r.get(3)?,
+                    genre: r.get(4)?,
+                    year: r.get(5)?,
+                    plays: r.get(6)?,
+                    liked: r.get(7)?,
+                })
+            })?
+            .collect()
+    }
+
+    /// The `limit` most recently played distinct songs.
+    pub fn recent_plays(&self, limit: usize) -> rusqlite::Result<Vec<i64>> {
+        self.conn()
+            .prepare("SELECT track_id FROM plays GROUP BY track_id ORDER BY MAX(played_at) DESC LIMIT ?")?
+            .query_map([limit as i64], |r| r.get(0))?
+            .collect()
+    }
+
     /// Tracks still needing a loudness measurement, in the order given (queue first), then the rest.
     pub fn tracks_missing_loudness(&self, limit: usize) -> rusqlite::Result<Vec<(i64, String)>> {
         self.conn()

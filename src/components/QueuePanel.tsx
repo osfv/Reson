@@ -80,6 +80,7 @@ export function QueuePanel() {
   const current = index != null ? queue[index] : undefined;
   const first = index != null ? index + 1 : 0;
   const upcoming = queue.slice(first);
+  const firstAuto = upcoming.findIndex((e) => e.auto);
 
   return (
     <motion.aside
@@ -134,6 +135,12 @@ export function QueuePanel() {
                       exit={{ opacity: 0, x: -12, transition: { duration: 0.15 } }}
                       transition={{ type: "spring", stiffness: 420, damping: 36 }}
                     >
+                      {i === firstAuto && (
+                        <div className={cn("px-2 pb-1.5", i > 0 && "pt-4")}>
+                          <h3 className="text-[13px] font-medium text-ink-muted">Autoplay</h3>
+                          <p className="text-xs text-ink-faint">Similar songs from your library</p>
+                        </div>
+                      )}
                       <QueueRow entry={e} at={first + i} />
                     </motion.div>
                   ))}
