@@ -11,6 +11,7 @@ export type Route =
   | { name: "playlist"; id: number; rename?: boolean }
   | { name: "liked" }
   | { name: "year"; year: number }
+  | { name: "smart"; id: number }
   | { name: "search" };
 
 export interface MenuItem {
@@ -55,6 +56,10 @@ interface UiState {
   openMenu: (x: number, y: number, items: MenuItem[]) => void;
   closeMenu: () => void;
   showInfo: (id: number | null) => void;
+  /** Smart playlist rule editor: `id` null creates a new one. */
+  smartEditor: { id: number | null } | null;
+  editSmart: (id: number | null) => void;
+  closeSmartEditor: () => void;
   toast: (message: string) => void;
 }
 
@@ -108,6 +113,9 @@ export const useUi = create<UiState>((set, get) => ({
   openMenu: (x, y, items) => set({ menu: { x, y, items } }),
   closeMenu: () => set({ menu: null }),
   showInfo: (id) => set({ info: id }),
+  smartEditor: null,
+  editSmart: (id) => set({ smartEditor: { id }, menu: null }),
+  closeSmartEditor: () => set({ smartEditor: null }),
   toast: (message) => {
     const id = ++toastId;
     set((s) => ({ toasts: [...s.toasts, { id, message }] }));

@@ -8,12 +8,13 @@ use tauri::ipc::{InvokeBody, Request, Response};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
-use crate::db::{History, Library, Playlist, YearStats};
+use crate::db::{History, Library, Playlist, SmartPlaylist, YearStats};
 use crate::lyrics::{self, Candidate, Lyrics};
 use crate::output::DeviceInfo;
 use crate::player::{Cmd, Repeat, Snapshot};
 use crate::updater::{self, UpdateInfo};
 use crate::library;
+use crate::smart::Rules;
 use crate::{AppState, Prefs};
 
 type Res<T> = Result<T, String>;
@@ -68,6 +69,39 @@ pub fn playlist_set_tracks(state: State<AppState>, id: i64, track_ids: Vec<i64>)
 #[tauri::command]
 pub fn playlist_add_tracks(state: State<AppState>, id: i64, track_ids: Vec<i64>) -> Res<()> {
     state.db.playlist_add_tracks(id, &track_ids).map_err(err)
+}
+
+#[tauri::command]
+pub fn smart_playlists_get(state: State<AppState>) -> Res<Vec<SmartPlaylist>> {
+    state.db.smart_playlists().map_err(err)
+}
+
+/// Live match list for the rule editor.
+#[tauri::command]
+pub fn smart_preview(state: State<AppState>, rules: Rules) -> Res<Vec<i64>> {
+    state.db.smart_tracks(&rules)
+}
+
+#[tauri::command]
+pub fn smart_create(state: State<AppState>, name: String, rules: Rules) -> Res<SmartPlaylist> {
+    state.db.smart_create(name.trim(), &rules)
+}
+
+#[tauri::command]
+pub fn smart_update(state: State<AppState>, id: i64, name: String, rules: Rules) -> Res<()> {
+    state.db.smart_update(id, name.trim(), &rules)
+}
+
+#[tauri::command]
+pub fn smart_delete(state: State<AppState>, id: i64) -> Res<()> {
+    state.db.smart_delete(id).map_err(err)
+}
+
+/// Opt-in suggestions; returns the full, re-evaluated list.
+#[tauri::command]
+pub fn smart_add_defaults(state: State<AppState>) -> Res<Vec<SmartPlaylist>> {
+    state.db.smart_add_defaults()?;
+    state.db.smart_playlists().map_err(err)
 }
 
 /// Network-bound, so it runs off the main thread.

@@ -50,12 +50,67 @@ export interface Playlist {
   trackIds: number[];
 }
 
+export type SmartField =
+  | "title"
+  | "artist"
+  | "album"
+  | "albumArtist"
+  | "genre"
+  | "year"
+  | "plays"
+  | "lastPlayed"
+  | "addedAt"
+  | "duration"
+  | "format"
+  | "bitDepth"
+  | "sampleRate"
+  | "bitrate";
+
+export type SmartOp =
+  | "is"
+  | "isNot"
+  | "contains"
+  | "notContains"
+  | "startsWith"
+  | "endsWith"
+  | "gt"
+  | "lt"
+  | "between"
+  | "inLast"
+  | "notInLast"
+  | "before"
+  | "after";
+
+export interface SmartRule {
+  field: SmartField;
+  op: SmartOp;
+  /** Text, a number, or [low, high] for "between". Days for inLast/notInLast, unix seconds for before/after. */
+  value: string | number | [number, number];
+}
+
+export interface SmartRules {
+  match: "all" | "any";
+  rules: SmartRule[];
+  limit: number | null;
+  sort: { field: SmartField | "random"; desc: boolean; seed?: number } | null;
+}
+
+export interface SmartPlaylist {
+  id: number;
+  name: string;
+  createdAt: number;
+  rules: SmartRules;
+  /** Evaluated by the backend from `rules`. */
+  trackIds: number[];
+}
+
 export interface Library {
   tracks: Track[];
   albums: Album[];
   playlists: Playlist[];
   /** Liked track ids, most recent first. */
   liked: number[];
+  smartPlaylists: SmartPlaylist[];
 }
 
 export type Repeat = "off" | "all" | "one";
@@ -239,6 +294,13 @@ export const api = {
   playlistDelete: (id: number) => invoke<void>("playlist_delete", { id }),
   playlistSetTracks: (id: number, trackIds: number[]) => invoke<void>("playlist_set_tracks", { id, trackIds }),
   playlistAddTracks: (id: number, trackIds: number[]) => invoke<void>("playlist_add_tracks", { id, trackIds }),
+
+  smartPlaylists: () => invoke<SmartPlaylist[]>("smart_playlists_get"),
+  smartPreview: (rules: SmartRules) => invoke<number[]>("smart_preview", { rules }),
+  smartCreate: (name: string, rules: SmartRules) => invoke<SmartPlaylist>("smart_create", { name, rules }),
+  smartUpdate: (id: number, name: string, rules: SmartRules) => invoke<void>("smart_update", { id, name, rules }),
+  smartDelete: (id: number) => invoke<void>("smart_delete", { id }),
+  smartAddDefaults: () => invoke<SmartPlaylist[]>("smart_add_defaults"),
 
   playerState: () => invoke<PlayerSnapshot>("player_state"),
   play: (trackIds: number[], index = 0) => invoke<void>("player_play", { trackIds, index }),

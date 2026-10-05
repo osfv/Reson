@@ -1,9 +1,9 @@
 import type { MouseEvent, ReactNode } from "react";
-import { ChartBar, GearSix, Heart, House, MicrophoneStage, MusicNotesSimple, Plus, VinylRecord, X } from "@phosphor-icons/react";
+import { ChartBar, GearSix, Heart, House, MicrophoneStage, MusicNotesSimple, Plus, Sparkle, VinylRecord, X } from "@phosphor-icons/react";
 import { useSystem } from "../store/system";
 import { UpdateButton } from "./settings/About";
 import { motion, AnimatePresence } from "motion/react";
-import { createPlaylist, importFiles, importFolders } from "../lib/actions";
+import { addSuggestedSmartPlaylists, createPlaylist, importFiles, importFolders, smartPlaylistMenu } from "../lib/actions";
 import { cn } from "../lib/cn";
 import { plural } from "../lib/format";
 import { clickSuppressed, useDrag } from "../store/drag";
@@ -131,6 +131,68 @@ function LikedEntry() {
   );
 }
 
+function SmartPlaylists() {
+  const smart = useLibrary((s) => s.smartPlaylists);
+  const trackById = useLibrary((s) => s.trackById);
+  const albumById = useLibrary((s) => s.albumById);
+  const route = useUi((s) => s.route);
+  const navigate = useUi((s) => s.navigate);
+  const openMenu = useUi((s) => s.openMenu);
+  const editSmart = useUi((s) => s.editSmart);
+
+  return (
+    <>
+      <div className="mt-4 flex items-center justify-between pl-3">
+        <h2 className="text-sm font-medium text-ink-muted">Smart playlists</h2>
+        <IconButton label="New smart playlist" onClick={() => editSmart(null)}>
+          <Plus size={18} />
+        </IconButton>
+      </div>
+      {smart.length === 0 ? (
+        <div className="px-3 py-2 text-[13px] leading-relaxed text-ink-faint">
+          <p>Playlists that fill themselves from rules, like your most played songs.</p>
+          <button
+            type="button"
+            onClick={addSuggestedSmartPlaylists}
+            className="mt-1.5 font-medium text-ink-muted underline-offset-2 transition-colors hover:text-ink hover:underline"
+          >
+            Add suggestions
+          </button>
+        </div>
+      ) : (
+        smart.map((p) => {
+          const active = route.name === "smart" && route.id === p.id;
+          const tracks = p.trackIds.map((id) => trackById.get(id)).filter((t) => t != null);
+          return (
+            <button
+              key={p.id}
+              type="button"
+              onClick={() => navigate({ name: "smart", id: p.id })}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                openMenu(e.clientX, e.clientY, smartPlaylistMenu(p.id));
+              }}
+              className={cn(
+                "flex w-full items-center gap-3 rounded-md p-1.5 text-left transition-colors",
+                active ? "bg-white/[0.07]" : "hover:bg-white/[0.04]",
+              )}
+            >
+              <span className="relative shrink-0">
+                <Mosaic albums={albumCovers(tracks, albumById)} className="h-10 w-10 rounded-md" />
+                <Sparkle size={12} weight="fill" className="absolute -bottom-0.5 -right-0.5 rounded-full bg-[var(--surface)] p-[1px] text-accent" />
+              </span>
+              <span className="min-w-0">
+                <span className={cn("block truncate text-sm", active ? "text-accent" : "text-ink")}>{p.name}</span>
+                <span className="block truncate text-xs text-ink-muted">{plural(tracks.length, "song")}</span>
+              </span>
+            </button>
+          );
+        })
+      )}
+    </>
+  );
+}
+
 export function Sidebar() {
   const playlists = useLibrary((s) => s.playlists);
   const trackById = useLibrary((s) => s.trackById);
@@ -229,6 +291,7 @@ export function Sidebar() {
             );
           })
         )}
+        <SmartPlaylists />
       </div>
 
       <UpdateCard />
