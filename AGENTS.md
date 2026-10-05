@@ -73,6 +73,10 @@ Verify changes with `npm run typecheck` and `cargo check` at minimum; run `cargo
   `releases/latest/download/latest.json` (Tauri's manifest format), verifies the installer with `minisign-verify`
   against `PUBLIC_KEY`, runs it with `/P /UPDATE /R`, and exits. `tests/fixtures/updater-fixture.txt(.sig)` proves
   the compiled key matches the release key.
+- `src-tauri/src/smart.rs`: smart playlists store only their rules (JSON in `smart_playlists.rules`); `Rules::compile`
+  turns them into one parameterized query re-run on every library read (and after each play via `history:changed`).
+  Random sort is shuffled in Rust (`Rules::finish`, SplitMix64 per seed) because SQL arithmetic hashes only rotate
+  one fixed order. Date values are the local start of the chosen day; "after" begins on the next day.
 - Likes live in the `likes` table (`Library.liked`, most recent first); Statistics (the `year` route) come from `plays` via
   `Db::year_stats` (local-time years). The share card is drawn on a canvas in `src/lib/shareCard.ts`; covers come
   in through `cover_bytes` because asset-protocol images would taint the canvas.
