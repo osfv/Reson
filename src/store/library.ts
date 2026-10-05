@@ -18,10 +18,17 @@ interface LibraryState {
   albumTracks: Map<number, Track[]>;
   artists: Artist[];
   artistByName: Map<string, Artist>;
+  /** Liked track ids, most recent first. */
+  liked: number[];
+  likedSet: Set<number>;
   scan: ScanProgress | null;
   refresh: () => Promise<void>;
   setScan: (scan: ScanProgress) => void;
   setPlaylists: (fn: (p: Playlist[]) => Playlist[]) => void;
+  /** Likes or unlikes tracks (optimistic). */
+  setLiked: (ids: number[], liked: boolean) => void;
+  /** Applies background spectral-check results without reloading the library. */
+  patchCutoffs: (results: { id: number; cutoffHz: number }[]) => void;
 }
 
 const byDiscTrack = (a: Track, b: Track) =>
@@ -54,7 +61,7 @@ function index(lib: Library) {
   return { trackById, albumById, albumTracks, artists, artistByName };
 }
 
-export const useLibrary = create<LibraryState>((set) => ({
+export const useLibrary = create<LibraryState>((set, get) => ({
   loaded: false,
   error: null,
   tracks: [],
@@ -65,17 +72,41 @@ export const useLibrary = create<LibraryState>((set) => ({
   albumTracks: new Map(),
   artists: [],
   artistByName: new Map(),
+  liked: [],
+  likedSet: new Set(),
   scan: null,
   refresh: async () => {
     try {
       const lib = await api.library();
-      set({ loaded: true, error: null, tracks: lib.tracks, albums: lib.albums, playlists: lib.playlists, ...index(lib) });
+      set({
+        loaded: true,
+        error: null,
+        tracks: lib.tracks,
+        albums: lib.albums,
+        playlists: lib.playlists,
+        liked: lib.liked,
+        likedSet: new Set(lib.liked),
+        ...index(lib),
+      });
     } catch (e) {
       set({ loaded: true, error: String(e) });
     }
   },
   setScan: (scan) => set({ scan }),
   setPlaylists: (fn) => set((s) => ({ playlists: fn(s.playlists) })),
+  setLiked: (ids, liked) => {
+    const { liked: order } = get();
+    const changed = new Set(ids);
+    const next = liked ? [...ids.filter((id) => !order.includes(id)).reverse(), ...order] : order.filter((id) => !changed.has(id));
+    set({ liked: next, likedSet: new Set(next) });
+    for (const id of ids) api.setLiked(id, liked).catch(() => get().refresh());
+  },
+  patchCutoffs: (results) => {
+    const { tracks, albumById } = get();
+    const byId = new Map(results.map((r) => [r.id, r.cutoffHz]));
+    const next = tracks.map((t) => (byId.has(t.id) ? { ...t, cutoffHz: byId.get(t.id)! } : t));
+    set({ tracks: next, ...index({ tracks: next, albums: [...albumById.values()], playlists: [], liked: [] }) });
+  },
 }));
 
 export const albumCovers = (tracks: Track[], albumById: Map<number, Album>, max = 4): Album[] => {

@@ -1,0 +1,1 @@
+Reson updater signature fixture. Signed with the release key; see updater.rs tests.

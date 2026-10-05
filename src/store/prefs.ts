@@ -30,6 +30,9 @@ interface PrefsState {
   setUi: (patch: Partial<UiPrefs>) => void;
 }
 
+/** Sliders (EQ, crossfade) change prefs many times a second; the backend only needs the last. */
+let saveTimer: number | undefined;
+
 export const usePrefs = create<PrefsState>((set, get) => ({
   prefs: null,
   ui: loadUi(),
@@ -41,7 +44,11 @@ export const usePrefs = create<PrefsState>((set, get) => ({
     if (!cur) return;
     const next = { ...cur, ...patch };
     set({ prefs: next });
-    api.prefsSet(next);
+    window.clearTimeout(saveTimer);
+    saveTimer = window.setTimeout(() => {
+      const latest = get().prefs;
+      if (latest) api.prefsSet(latest);
+    }, 80);
   },
   setUi: (patch) => {
     const next = { ...get().ui, ...patch };

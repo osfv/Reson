@@ -1,8 +1,8 @@
 import { useEffect } from "react";
-import { MusicNotesSimple, Plus, Queue } from "@phosphor-icons/react";
+import { Heart, MusicNotesSimple, Plus, Queue } from "@phosphor-icons/react";
 import { AnimatePresence, motion, useSpring } from "motion/react";
 import { api } from "../lib/api";
-import { addToPlaylist, createPlaylist } from "../lib/actions";
+import { addToPlaylist, createPlaylist, likeTracks } from "../lib/actions";
 import { onDrop, pointerX, pointerY, useDrag } from "../store/drag";
 import { useLibrary } from "../store/library";
 import { useUi } from "../store/ui";
@@ -15,6 +15,7 @@ function useGlobalDrops() {
         const [kind, arg] = target.split(":");
         if (kind === "playlist") addToPlaylist(Number(arg), payload.trackIds);
         else if (kind === "new-playlist") createPlaylist(payload.trackIds);
+        else if (kind === "liked") likeTracks(payload.trackIds, true);
         else if (kind === "queue") {
           const at = Number(arg);
           if (payload.source.kind === "queue") api.move(payload.source.uid, at);
@@ -42,6 +43,8 @@ export function DragLayer() {
       ? { icon: <Plus size={14} weight="bold" />, text: `Add to ${playlistName ?? "playlist"}` }
       : over === "new-playlist"
         ? { icon: <Plus size={14} weight="bold" />, text: "New playlist" }
+        : over === "liked"
+          ? { icon: <Heart size={14} weight="fill" />, text: "Add to Liked songs" }
         : over.startsWith("queue:")
           ? { icon: <Queue size={14} />, text: payload?.source.kind === "queue" ? "Move here" : "Add to queue" }
           : null;

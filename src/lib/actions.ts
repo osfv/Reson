@@ -5,7 +5,7 @@ import { watchFolders } from "../store/prefs";
 import { useUi, type MenuItem } from "../store/ui";
 import { plural } from "./format";
 
-const AUDIO_EXTS = ["mp3", "flac", "m4a", "mp4", "aac", "ogg", "oga", "wav"];
+const AUDIO_EXTS = ["mp3", "flac", "m4a", "mp4", "aac", "ogg", "oga", "opus", "wav", "ape", "wv"];
 
 const fail = (e: unknown) => useUi.getState().toast(String(e));
 
@@ -89,6 +89,14 @@ export function deletePlaylist(id: number) {
   api.playlistDelete(id).catch(fail);
 }
 
+export function likeTracks(ids: number[], liked: boolean) {
+  if (!ids.length) return;
+  useLibrary.getState().setLiked(ids, liked);
+  if (ids.length > 1 || !liked) {
+    useUi.getState().toast(liked ? `Added ${plural(ids.length, "song")} to Liked songs` : "Removed from Liked songs");
+  }
+}
+
 export async function removeFromLibrary(ids: number[]) {
   try {
     await api.removeTracks(ids);
@@ -100,14 +108,19 @@ export async function removeFromLibrary(ids: number[]) {
 
 /** Context menu for one or more tracks. `playlist` adds playlist-specific entries. */
 export function trackMenu(ids: number[], opts: { playlistId?: number; positions?: number[] } = {}): MenuItem[] {
-  const { playlists, trackById, albumById } = useLibrary.getState();
+  const { playlists, trackById, albumById, likedSet } = useLibrary.getState();
   const { navigate } = useUi.getState();
   const single = ids.length === 1 ? trackById.get(ids[0]) : undefined;
   const album = single ? albumById.get(single.albumId) : undefined;
+  const allLiked = ids.every((id) => likedSet.has(id));
 
   const items: MenuItem[] = [
     { label: "Play next", onSelect: () => enqueue(ids, true) },
     { label: "Add to queue", onSelect: () => enqueue(ids, false) },
+    {
+      label: allLiked ? "Remove from Liked songs" : "Save to Liked songs",
+      onSelect: () => likeTracks(ids, !allLiked),
+    },
     {
       label: "Add to playlist",
       submenu: [

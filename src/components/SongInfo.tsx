@@ -1,8 +1,9 @@
 import { useEffect, useRef } from "react";
-import { WarningCircle, X } from "@phosphor-icons/react";
+import { CheckCircle, CircleNotch, Info, Question, WarningCircle, X } from "@phosphor-icons/react";
 import { motion } from "motion/react";
 import { cn } from "../lib/cn";
 import { extensionOf, formatBytes, formatTime, isLossless, mislabeled } from "../lib/format";
+import { qualityVerdict, type Verdict } from "../lib/quality";
 import { useLibrary } from "../store/library";
 import { useUi } from "../store/ui";
 import { IconButton } from "./Buttons";
@@ -10,6 +11,23 @@ import { Cover } from "./Cover";
 import { FormatBadge } from "./FormatBadge";
 
 const channelLabel = (n: number) => (n === 1 ? "Mono" : n === 2 ? "Stereo" : `${n} channels`);
+
+function VerdictIcon({ level }: { level: Verdict["level"] }) {
+  const cls = "mt-px shrink-0";
+  switch (level) {
+    case "likely":
+    case "upsampled":
+      return <WarningCircle size={20} className={cn(cls, "text-accent")} />;
+    case "maybe":
+      return <Info size={20} className={cn(cls, "text-ink-muted")} />;
+    case "clean":
+      return <CheckCircle size={20} className={cn(cls, "text-accent")} />;
+    case "pending":
+      return <CircleNotch size={20} className={cn(cls, "animate-spin text-ink-muted")} />;
+    default:
+      return <Question size={20} className={cn(cls, "text-ink-muted")} />;
+  }
+}
 
 export function SongInfo({ id }: { id: number }) {
   const track = useLibrary((s) => s.trackById.get(id));
@@ -23,6 +41,7 @@ export function SongInfo({ id }: { id: number }) {
 
   if (!track) return null;
   const wrongExt = mislabeled(track);
+  const verdict = qualityVerdict(track);
   const facts: [string, string | null][] = [
     ["Format", track.format ? `${track.format}, ${isLossless(track.format) ? "lossless" : "lossy"}` : null],
     ["Bit depth", track.bitDepth ? `${track.bitDepth}-bit` : null],
@@ -79,6 +98,16 @@ export function SongInfo({ id }: { id: number }) {
               This file is named <span className="font-mono text-ink">.{wrongExt}</span>, but the audio inside is{" "}
               <span className="font-medium text-ink">{track.format}</span>.
             </p>
+          </div>
+        )}
+
+        {verdict && (
+          <div className="mt-5 flex gap-3 rounded-md bg-white/[0.05] p-3 text-sm">
+            <VerdictIcon level={verdict.level} />
+            <div>
+              <p className="font-medium text-ink">{verdict.title}</p>
+              <p className="mt-0.5 leading-relaxed text-ink-muted">{verdict.body}</p>
+            </div>
           </div>
         )}
 

@@ -1,7 +1,8 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { api, type PlayerSnapshot, type ScanProgress, type Spectrum } from "../lib/api";
+import { api, type PlayerSnapshot, type ScanProgress, type Spectrum, type UpdateInfo } from "../lib/api";
+import { useSystem } from "../store/system";
 import { startClock } from "../lib/clock";
 import { plural } from "../lib/format";
 import { useHistory } from "../store/history";
@@ -21,8 +22,26 @@ export function useBridge(onDragChange?: (over: boolean) => void) {
     usePrefs.getState().load().catch(() => {});
     useHistory.getState().refresh();
     api.playerState().then(usePlayer.getState().setSnapshot).catch(() => {});
+    useSystem.getState().refreshLastfm().catch(() => {});
+
+    // Spectral-check results trickle in one track at a time; apply them in small batches.
+    let analysis: { id: number; cutoffHz: number }[] = [];
+    let analysisTimer: number | undefined;
 
     const subs: Promise<() => void>[] = [
+      listen<{ id: number; cutoffHz: number }>("library:analysis", (e) => {
+        analysis.push(e.payload);
+        window.clearTimeout(analysisTimer);
+        analysisTimer = window.setTimeout(() => {
+          useLibrary.getState().patchCutoffs(analysis);
+          analysis = [];
+        }, 600);
+      }),
+      listen<UpdateInfo>("update:available", (e) => useSystem.getState().setUpdate(e.payload)),
+      listen<{ downloaded: number; total: number | null }>("update:progress", (e) =>
+        useSystem.setState({ installing: e.payload }),
+      ),
+      listen("lastfm:changed", () => useSystem.getState().refreshLastfm()),
       listen<PlayerSnapshot>("player:state", (e) => usePlayer.getState().setSnapshot(e.payload)),
       listen<{ position: number; duration: number }>("player:progress", (e) =>
         usePlayer.getState().setProgress(e.payload.position, e.payload.duration),
@@ -66,6 +85,7 @@ export function useBridge(onDragChange?: (over: boolean) => void) {
     }
     const unlisten = Promise.all(subs);
     return () => {
+      window.clearTimeout(analysisTimer);
       unlisten.then((fns) => fns.forEach((f) => f()));
     };
   }, [onDragChange]);

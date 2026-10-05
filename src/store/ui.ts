@@ -9,6 +9,8 @@ export type Route =
   | { name: "album"; id: number }
   | { name: "artist"; artist: string }
   | { name: "playlist"; id: number; rename?: boolean }
+  | { name: "liked" }
+  | { name: "year"; year: number }
   | { name: "search" };
 
 export interface MenuItem {

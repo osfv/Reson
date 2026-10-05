@@ -29,6 +29,9 @@ export interface Track {
   channels: number | null;
   /** bytes */
   size: number | null;
+  /** Spectral check of lossless files: null = not yet, -1 = couldn't tell, 0 = full band,
+   * otherwise the frequency (Hz) where the audio stops. */
+  cutoffHz: number | null;
 }
 
 export interface Album {
@@ -51,6 +54,8 @@ export interface Library {
   tracks: Track[];
   albums: Album[];
   playlists: Playlist[];
+  /** Liked track ids, most recent first. */
+  liked: number[];
 }
 
 export type Repeat = "off" | "all" | "one";
@@ -69,6 +74,15 @@ export interface PlayerSnapshot {
   repeat: Repeat;
   position: number;
   duration: number;
+  /** Set while playing through WASAPI exclusive mode. */
+  output: OutputStatus | null;
+}
+
+export interface OutputStatus {
+  exclusive: boolean;
+  rate: number;
+  bits: number;
+  bitPerfect: boolean;
 }
 
 export interface ScanProgress {
@@ -108,12 +122,90 @@ export interface History {
   topTracks: [number, number][];
 }
 
+export type FilterKind = "peak" | "lowShelf" | "highShelf";
+
+export interface EqFilter {
+  kind: FilterKind;
+  freq: number;
+  /** dB */
+  gain: number;
+  q: number;
+}
+
+export interface EqProfile {
+  name: string;
+  preamp: number;
+  filters: EqFilter[];
+}
+
+export interface EqSettings {
+  enabled: boolean;
+  /** dB for each of EQ_FREQS. */
+  bands: number[];
+  preamp: number;
+  profile: EqProfile | null;
+}
+
 export interface Prefs {
   /** Seconds; 0 means gapless. */
   crossfade: number;
   normalize: boolean;
   watchFolders: string[];
   closeToTray: boolean;
+  eq: EqSettings;
+  /** Endpoint id; null follows the Windows default. */
+  outputDevice: string | null;
+  exclusive: boolean;
+  discord: boolean;
+  /** The user's own Discord application id. */
+  discordAppId: string | null;
+  discordCovers: boolean;
+  autoUpdate: boolean;
+}
+
+export interface AudioDevice {
+  id: string;
+  name: string;
+  default: boolean;
+}
+
+export interface YearStats {
+  year: number;
+  years: number[];
+  plays: number;
+  minutes: number;
+  songs: number;
+  artists: number;
+  albums: number;
+  /** [track id, plays, minutes] */
+  topTracks: [number, number, number][];
+  /** [album id, plays, minutes] */
+  topAlbums: [number, number, number][];
+  /** [album artist, plays, minutes] */
+  topArtists: [string, number, number][];
+  topGenres: [string, number][];
+  /** Minutes per month, January first. */
+  months: number[];
+  topDay: [string, number] | null;
+  longestStreak: number;
+  firstTrack: [number, string] | null;
+  liked: number;
+  newSongs: number;
+}
+
+export interface LastFmStatus {
+  /** The user has entered their own API key and secret. */
+  configured: boolean;
+  /** Last four characters of the API key in use. */
+  keyHint: string | null;
+  user: string | null;
+}
+
+export interface UpdateInfo {
+  version: string;
+  current: string;
+  notes: string;
+  date: string | null;
 }
 
 export interface Spectrum {
@@ -161,4 +253,23 @@ export const api = {
   jump: (uid: number) => invoke<void>("player_jump", { uid }),
   removeFromQueue: (uid: number) => invoke<void>("player_remove", { uid }),
   clearUpcoming: () => invoke<void>("player_clear_upcoming"),
+
+  setLiked: (trackId: number, liked: boolean) => invoke<void>("set_liked", { trackId, liked }),
+  audioDevices: () => invoke<AudioDevice[]>("audio_devices"),
+  yearStats: (year: number) => invoke<YearStats>("year_stats", { year }),
+  coverBytes: (albumId: number) => invoke<ArrayBuffer>("cover_bytes", { albumId }),
+  /** Opens a save dialog and writes the PNG. Resolves false if the user cancels. */
+  saveImage: (png: Uint8Array, fileName: string) =>
+    invoke<boolean>("save_image", png, { headers: { "x-file-name": fileName } }),
+  openLink: (url: string) => invoke<void>("open_link", { url }),
+  lastfmStatus: () => invoke<LastFmStatus>("lastfm_status"),
+  /** Resolves with the user name once approved in the browser, or null on timeout. */
+  lastfmConnect: () => invoke<string | null>("lastfm_connect"),
+  lastfmDisconnect: () => invoke<void>("lastfm_disconnect"),
+  lastfmSetKeys: (key: string, secret: string) => invoke<void>("lastfm_set_keys", { key, secret }),
+  lastfmClearKeys: () => invoke<void>("lastfm_clear_keys"),
+  /** Resolves with the Discord user name if the id works with the running Discord app. */
+  discordTest: (appId: string) => invoke<string>("discord_test", { appId }),
+  updateCheck: () => invoke<UpdateInfo | null>("update_check"),
+  updateInstall: () => invoke<void>("update_install"),
 };

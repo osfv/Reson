@@ -35,7 +35,9 @@ pub struct Analyzer {
     pub tap: Arc<Mutex<Arc<Tap>>>,
 }
 
-struct Fft {
+/// Radix-2 FFT with a Hann window. `n` must be a power of two.
+pub(crate) struct Fft {
+    n: usize,
     cos: Vec<f32>,
     sin: Vec<f32>,
     rev: Vec<usize>,
@@ -43,25 +45,27 @@ struct Fft {
 }
 
 impl Fft {
-    fn new() -> Self {
-        let bits = N.trailing_zeros();
+    pub(crate) fn new(n: usize) -> Self {
+        let bits = n.trailing_zeros();
         Self {
-            cos: (0..N / 2).map(|i| (2.0 * PI * i as f32 / N as f32).cos()).collect(),
-            sin: (0..N / 2).map(|i| -(2.0 * PI * i as f32 / N as f32).sin()).collect(),
-            rev: (0..N).map(|i| i.reverse_bits() >> (usize::BITS - bits)).collect(),
-            window: (0..N).map(|i| 0.5 - 0.5 * (2.0 * PI * i as f32 / (N - 1) as f32).cos()).collect(),
+            n,
+            cos: (0..n / 2).map(|i| (2.0 * PI * i as f32 / n as f32).cos()).collect(),
+            sin: (0..n / 2).map(|i| -(2.0 * PI * i as f32 / n as f32).sin()).collect(),
+            rev: (0..n).map(|i| i.reverse_bits() >> (usize::BITS - bits)).collect(),
+            window: (0..n).map(|i| 0.5 - 0.5 * (2.0 * PI * i as f32 / (n - 1) as f32).cos()).collect(),
         }
     }
 
-    /// Magnitudes of the first N/2 bins.
-    fn magnitudes(&self, input: &[f32]) -> Vec<f32> {
-        let mut re: Vec<f32> = (0..N).map(|i| input[self.rev[i]] * self.window[self.rev[i]]).collect();
-        let mut im = vec![0.0f32; N];
+    /// Magnitudes of the first n/2 bins.
+    pub(crate) fn magnitudes(&self, input: &[f32]) -> Vec<f32> {
+        let n = self.n;
+        let mut re: Vec<f32> = (0..n).map(|i| input[self.rev[i]] * self.window[self.rev[i]]).collect();
+        let mut im = vec![0.0f32; n];
         let mut size = 2;
-        while size <= N {
+        while size <= n {
             let half = size / 2;
-            let step = N / size;
-            for start in (0..N).step_by(size) {
+            let step = n / size;
+            for start in (0..n).step_by(size) {
                 for k in 0..half {
                     let (c, s) = (self.cos[k * step], self.sin[k * step]);
                     let (a, b) = (start + k, start + k + half);
@@ -75,7 +79,7 @@ impl Fft {
             }
             size *= 2;
         }
-        (0..N / 2).map(|i| (re[i] * re[i] + im[i] * im[i]).sqrt() / (N as f32 / 4.0)).collect()
+        (0..n / 2).map(|i| (re[i] * re[i] + im[i] * im[i]).sqrt() / (n as f32 / 4.0)).collect()
     }
 }
 
@@ -91,7 +95,7 @@ pub fn spawn(app: AppHandle, initial: Arc<Tap>) -> Analyzer {
 }
 
 fn run(app: AppHandle, enabled: Arc<AtomicBool>, tap: Arc<Mutex<Arc<Tap>>>) {
-    let fft = Fft::new();
+    let fft = Fft::new(N);
     let mut levels = [0f32; BANDS];
     let mut ceiling = -20f32;
     let mut bass = 0f32;
@@ -175,7 +179,7 @@ mod tests {
 
     #[test]
     fn fft_finds_a_tone() {
-        let fft = Fft::new();
+        let fft = Fft::new(N);
         let rate = 48_000.0;
         let hz = 1_000.0;
         let input: Vec<f32> = (0..N).map(|i| (2.0 * PI * hz * i as f32 / rate).sin()).collect();

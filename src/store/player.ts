@@ -22,6 +22,7 @@ export const usePlayer = create<PlayerState>((set, get) => ({
   repeat: "off",
   position: 0,
   duration: 0,
+  output: null,
   setSnapshot: (s) => {
     const prev = get();
     const jumped =

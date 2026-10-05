@@ -47,7 +47,8 @@ No account, no server, no streaming. Point Reson at a folder of FLACs or MP3s an
 - **It looks like your music.** Reson pulls a palette from each cover and fades the whole interface to it, with contrast checks so text stays readable on any artwork.
 - **Lyrics that keep time.** Synced lyrics arrive on their own, the current word fills as it's sung, and you can click any line to jump there.
 - **It tells you what your files really are.** Reson reads the audio inside the file, so an AAC renamed to `.mp3` shows up as AAC, and a 24-bit/96 kHz FLAC says so.
-- **It sounds right.** Gapless playback, optional crossfade, loudness normalization, and no clicks when you pause or seek.
+- **It sounds right.** Gapless playback, optional crossfade, loudness normalization, a 10-band EQ with AutoEQ headphone profiles, and bit-perfect WASAPI exclusive mode.
+- **It catches fake lossless.** A background check flags FLACs that were made from MP3s, and "hi-res" files upsampled from CD.
 
 ## Features
 
@@ -57,8 +58,10 @@ No account, no server, no streaming. Point Reson at a folder of FLACs or MP3s an
 - Gapless playback and optional crossfade (0 to 12 seconds)
 - Loudness normalization from ReplayGain tags, or measured in the background when a file has none
 - Short fades on pause, resume and seek, so you never hear a pop
+- 10-band equalizer with presets, a live response curve, and [AutoEQ](https://autoeq.app) headphone profiles
+- Pick any output device, or use WASAPI exclusive mode: each song plays at its own sample rate, bit-perfect at 100% volume
 - Queue with drag-to-reorder, shuffle, repeat one or all, and play history
-- Windows media overlay and hardware media keys
+- Windows media overlay, hardware media keys, and play controls in the taskbar preview
 - Mini player that stays on top, plus a tray icon
 </details>
 
@@ -81,6 +84,8 @@ No account, no server, no streaming. Point Reson at a folder of FLACs or MP3s an
 - Import folders or files, or drop them on the window
 - Watched folders pick up new downloads
 - Content-based format detection with bit depth, sample rate, bitrate and channels in Song info
+- Fake-lossless check: spots lossless files whose audio stops where an MP3 encoder would cut it
+- Liked songs: tap the heart anywhere, or drag songs onto Liked songs
 - Embedded cover art, or `cover.jpg` / `folder.jpg` next to the files
 - Move your files and Reson relinks them, keeping history, playlists and lyric timing
 - Albums, artists, songs, playlists, search (`Ctrl+K`) and a Home screen
@@ -95,7 +100,17 @@ No account, no server, no streaming. Point Reson at a folder of FLACs or MP3s an
 - Respects your system's reduced-motion setting
 </details>
 
-**Formats:** FLAC, ALAC, MP3, AAC/M4A, OGG Vorbis and WAV.
+<details open>
+<summary><b>Statistics and sharing</b></summary>
+
+- Statistics for each year: top songs, artists and albums, minutes listened, your biggest month and longest streak, plus an animated recap
+- Save your year as an image to post anywhere
+- Discord status showing what you're playing, with a "Try Reson today" button, through your own Discord app (a setup window walks you through it)
+- Last.fm scrobbling with your own free API account, queued while you're offline
+- Updates itself from GitHub releases, with signed installers
+</details>
+
+**Formats:** FLAC, ALAC, MP3, AAC/M4A, OGG Vorbis, Opus, WAV, Monkey's Audio (APE) and WavPack.
 
 ## Download
 
@@ -134,7 +149,12 @@ npm run tauri build   # release build and installer in src-tauri/target/release/
 
 ## Privacy
 
-Reson only uses the network to fetch lyrics, and only for songs you open the lyrics view on (or play, if the player bar lyric is on). It sends LRCLIB the song's title, artist, album and length. Publishing lyrics is opt-in and public. Your library stays in a local SQLite database.
+Your library stays in a local SQLite database. Reson talks to the network only for these, and you can turn each one off in Settings:
+
+- **Lyrics:** for songs you open the lyrics view on (or play, if the player bar lyric is on), it sends [LRCLIB](https://lrclib.net) the song's title, artist, album and length. Publishing lyrics is opt-in and public.
+- **Discord status:** off until you connect your own Discord app. It talks to the Discord app on your PC. To show album art, it looks the album and artist up on Apple's iTunes Search. Covers that aren't on iTunes are uploaded to a temporary host ([uguu.se](https://uguu.se), or [Litterbox](https://litterbox.catbox.moe) as a fallback) that deletes them within 3 days, because Discord only shows images from the web. You can turn album art off.
+- **Last.fm:** off until you add your own API key and connect your account. Your keys stay on your PC; Reson sends what you play.
+- **Updates:** checks Reson's GitHub releases a couple of times a day. Nothing installs without you clicking Update.
 
 ## Platform support
 

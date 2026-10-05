@@ -1,5 +1,7 @@
 import type { MouseEvent, ReactNode } from "react";
-import { GearSix, House, MicrophoneStage, MusicNotesSimple, Plus, VinylRecord } from "@phosphor-icons/react";
+import { ChartBar, GearSix, Heart, House, MicrophoneStage, MusicNotesSimple, Plus, VinylRecord, X } from "@phosphor-icons/react";
+import { useSystem } from "../store/system";
+import { UpdateButton } from "./settings/About";
 import { motion, AnimatePresence } from "motion/react";
 import { createPlaylist, importFiles, importFolders } from "../lib/actions";
 import { cn } from "../lib/cn";
@@ -69,6 +71,66 @@ function ScanStatus() {
   );
 }
 
+function UpdateCard() {
+  const update = useSystem((s) => s.update);
+  const dismissed = useSystem((s) => s.updateDismissed);
+  return (
+    <AnimatePresence>
+      {update && !dismissed && (
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: 10 }}
+          transition={{ type: "spring", stiffness: 420, damping: 34 }}
+          className="relative mx-2 mb-2 rounded-xl bg-white/[0.06] p-3"
+          role="status"
+        >
+          <button
+            type="button"
+            aria-label="Hide until next launch"
+            onClick={() => useSystem.setState({ updateDismissed: true })}
+            className="absolute right-1.5 top-1.5 grid h-6 w-6 place-items-center rounded-full text-ink-muted hover:bg-white/10 hover:text-ink"
+          >
+            <X size={12} />
+          </button>
+          <p className="pr-5 text-sm font-medium">Reson {update.version} is out</p>
+          <p className="mt-0.5 text-xs text-ink-muted">You have {update.current}.</p>
+          <UpdateButton className="mt-3 h-8 w-full justify-center px-3 text-[13px]" />
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+/** The Liked songs collection: always first, and a drop target for dragged songs. */
+function LikedEntry() {
+  const count = useLibrary((s) => s.liked.filter((id) => s.trackById.has(id)).length);
+  const active = useUi((s) => s.route.name === "liked");
+  const navigate = useUi((s) => s.navigate);
+  const target = useDrag((s) => s.over === "liked");
+  return (
+    <motion.button
+      type="button"
+      data-drop="liked"
+      animate={{ scale: target ? 1.03 : 1 }}
+      transition={{ type: "spring", stiffness: 500, damping: 30 }}
+      onClick={() => !clickSuppressed() && navigate({ name: "liked" })}
+      className={cn(
+        "flex w-full items-center gap-3 rounded-md p-1.5 text-left transition-colors",
+        target ? "bg-white/[0.1] ring-1 ring-accent" : active ? "bg-white/[0.07]" : "hover:bg-white/[0.04]",
+      )}
+    >
+      <span className="liked-tile grid h-10 w-10 shrink-0 place-items-center rounded-md text-white">
+        <Heart size={18} weight="fill" />
+      </span>
+      <span className="min-w-0">
+        <span className={cn("block truncate text-sm", active ? "text-accent" : "text-ink")}>Liked songs</span>
+        <span className="block truncate text-xs text-ink-muted">{plural(count, "song")}</span>
+      </span>
+    </motion.button>
+  );
+}
+
 export function Sidebar() {
   const playlists = useLibrary((s) => s.playlists);
   const trackById = useLibrary((s) => s.trackById);
@@ -105,6 +167,9 @@ export function Sidebar() {
         <NavItem route={{ name: "artists" }} icon={<MicrophoneStage />}>
           Artists
         </NavItem>
+        <NavItem route={{ name: "year", year: new Date().getFullYear() }} icon={<ChartBar />}>
+          Statistics
+        </NavItem>
       </nav>
 
       <div className="mt-6 flex items-center justify-between pl-5 pr-2">
@@ -130,6 +195,7 @@ export function Sidebar() {
             New playlist
           </motion.div>
         )}
+        <LikedEntry />
         {playlists.length === 0 ? (
           !dragging && (
             <p className="px-3 py-2 text-[13px] leading-relaxed text-ink-faint">
@@ -165,6 +231,7 @@ export function Sidebar() {
         )}
       </div>
 
+      <UpdateCard />
       <ScanStatus />
       <div className="flex items-center gap-1 border-t border-line p-2">
         <button

@@ -24,6 +24,8 @@ const EXTENSIONS: Record<string, string[]> = {
   OGG: ["ogg", "oga"],
   Opus: ["opus", "ogg"],
   WAV: ["wav"],
+  APE: ["ape"],
+  WavPack: ["wv"],
 };
 
 export const isLossless = (format: string | null | undefined) => !!format && LOSSLESS.has(format);

@@ -24,11 +24,12 @@ import { usePlayer } from "../store/player";
 import { useUi } from "../store/ui";
 import { Cover } from "./Cover";
 import { FormatBadge } from "./FormatBadge";
+import { LikeButton } from "./LikeButton";
 
 const ROW = 56;
 const COLS = {
-  library: "grid-cols-[2rem_minmax(0,1.4fr)_minmax(0,1fr)_4.5rem_3.5rem_2rem]",
-  album: "grid-cols-[2rem_minmax(0,1fr)_4.5rem_3.5rem_2rem]",
+  library: "grid-cols-[2rem_minmax(0,1.4fr)_minmax(0,1fr)_4.5rem_2rem_3.5rem_2rem]",
+  album: "grid-cols-[2rem_minmax(0,1fr)_4.5rem_2rem_3.5rem_2rem]",
 };
 
 interface TrackListProps {
@@ -76,6 +77,7 @@ const Row = memo(function Row({
   onDragStart?: (i: number, e: PointerEvent) => void;
 }) {
   const album = useLibrary((s) => s.albumById.get(track.albumId));
+  const liked = useLibrary((s) => s.likedSet.has(track.id));
   const navigate = useUi((s) => s.navigate);
   const lib = variant === "library";
 
@@ -149,6 +151,12 @@ const Row = memo(function Row({
       <span>
         <FormatBadge track={track} />
       </span>
+
+      <LikeButton
+        trackId={track.id}
+        size={16}
+        className={cn("-mx-1.5", !liked && "opacity-0 focus-visible:opacity-100 group-hover:opacity-100")}
+      />
 
       <span className="text-right font-mono text-[13px] text-ink-muted tabular-nums">{formatTime(track.duration)}</span>
 
@@ -278,6 +286,7 @@ export function TrackList({ tracks, variant = "library", playlistId, onMove }: T
         <span>Title</span>
         {variant === "library" && <span>Album</span>}
         <span>Format</span>
+        <span />
         <span className="flex justify-end" aria-label="Duration">
           <Clock size={16} />
         </span>

@@ -10,6 +10,7 @@ import { useUi } from "../store/ui";
 import { IconButton } from "./Buttons";
 import { Cover } from "./Cover";
 import { FormatBadge } from "./FormatBadge";
+import { LikeButton } from "./LikeButton";
 import { useActiveLine } from "./lyrics/SyncedLyrics";
 import { Progress, Transport, Volume } from "./PlayerControls";
 
@@ -93,6 +94,7 @@ export function PlayerBar() {
                   <button type="button" aria-label="Song info" onClick={() => showInfo(track.id)} className="shrink-0">
                     <FormatBadge track={track} />
                   </button>
+                  <LikeButton trackId={track.id} size={16} className="-my-2 -ml-1" />
                 </div>
                 <button
                   type="button"
