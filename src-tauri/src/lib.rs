@@ -1,16 +1,28 @@
 mod analysis;
+mod autoplay;
 mod background;
 mod commands;
 mod db;
+mod decode;
+mod discord;
 mod dsp;
+mod lastfm;
 mod library;
 mod lyrics;
 mod media;
+mod output;
 mod palette;
 mod player;
+mod presence;
+mod smart;
+mod spectral;
+mod taskbar;
+mod updater;
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -18,6 +30,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 const PREFS_KEY: &str = "prefs";
+const UPDATE_CHECK_EVERY: Duration = Duration::from_secs(12 * 3600);
 
 /// User preferences that the backend needs. UI-only preferences live in the webview's storage.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -27,17 +40,49 @@ pub struct Prefs {
     pub normalize: bool,
     pub watch_folders: Vec<String>,
     pub close_to_tray: bool,
+    pub eq: dsp::EqSettings,
+    pub output_device: Option<String>,
+    pub exclusive: bool,
+    /// Show what's playing as a Discord status.
+    pub discord: bool,
+    /// The user's own Discord application (its name shows after "Listening to").
+    pub discord_app_id: Option<String>,
+    /// Look up public cover art so the Discord status can show it.
+    pub discord_covers: bool,
+    pub auto_update: bool,
+    /// When the queue runs out, keep playing similar songs from the library.
+    pub autoplay: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { crossfade: 0.0, normalize: true, watch_folders: Vec::new(), close_to_tray: false }
+        Self {
+            crossfade: 0.0,
+            normalize: true,
+            watch_folders: Vec::new(),
+            close_to_tray: false,
+            eq: dsp::EqSettings::default(),
+            output_device: None,
+            exclusive: false,
+            discord: true,
+            discord_app_id: None,
+            discord_covers: true,
+            auto_update: true,
+            autoplay: true,
+        }
     }
 }
 
 impl Prefs {
     pub fn playback(&self) -> player::PlaybackPrefs {
-        player::PlaybackPrefs { crossfade: self.crossfade.clamp(0.0, 12.0), normalize: self.normalize }
+        player::PlaybackPrefs {
+            crossfade: self.crossfade.clamp(0.0, 12.0),
+            normalize: self.normalize,
+            eq: self.eq.clone(),
+            output_device: self.output_device.clone(),
+            exclusive: self.exclusive,
+            autoplay: self.autoplay,
+        }
     }
 }
 
@@ -50,6 +95,53 @@ pub struct AppState {
     pub analyzer: analysis::Analyzer,
     pub loudness: background::Loudness,
     pub watch: background::Watch,
+    pub discord: Arc<discord::DiscordCtl>,
+    pub lastfm: Arc<lastfm::LastFm>,
+    /// The newer release found by the last update check.
+    pub update: Mutex<Option<updater::UpdateInfo>>,
+}
+
+/// Opens an https link in the default browser.
+pub fn open_url(url: &str) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("Only https links can be opened".into());
+    }
+    #[cfg(windows)]
+    {
+        use windows::core::{w, HSTRING, PCWSTR};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let r = unsafe { ShellExecuteW(None, w!("open"), &HSTRING::from(url), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };
+        if r.0 as isize <= 32 {
+            return Err("Couldn't open the browser".into());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open").arg(url).spawn().map_err(|e| e.to_string())?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    std::process::Command::new("xdg-open").arg(url).spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Checks GitHub for a newer release now and then, and tells the UI when there is one.
+fn spawn_update_checks(app: AppHandle) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(20));
+        loop {
+            let state = app.state::<AppState>();
+            let enabled = state.prefs.lock().map(|p| p.auto_update).unwrap_or(true);
+            if enabled {
+                let current = app.package_info().version.to_string();
+                if let Ok(Some(update)) = updater::check(&current) {
+                    if let Ok(mut slot) = state.update.lock() {
+                        *slot = Some(update.clone());
+                    }
+                    let _ = app.emit("update:available", update);
+                }
+            }
+            std::thread::sleep(UPDATE_CHECK_EVERY);
+        }
+    });
 }
 
 pub fn show_main(app: &AppHandle) {
@@ -173,8 +265,18 @@ pub fn run() {
             let hwnd = None;
             let tap = dsp::Tap::new();
             let analyzer = analysis::spawn(app.handle().clone(), tap.clone());
-            let player = player::spawn(app.handle().clone(), db.clone(), hwnd, tap, prefs.playback());
-            let loudness = background::spawn_loudness(db.clone(), player.sender());
+            let discord = Arc::new(discord::DiscordCtl {
+                enabled: AtomicBool::new(prefs.discord),
+                covers: AtomicBool::new(prefs.discord_covers),
+                app_id: Mutex::new(prefs.discord_app_id.clone()),
+            });
+            let lastfm = lastfm::LastFm::new(db.clone());
+            let listeners = vec![discord::spawn(db.clone(), discord.clone()), lastfm::spawn(app.handle().clone(), lastfm.clone())];
+            let player = player::spawn(app.handle().clone(), db.clone(), hwnd, tap, prefs.playback(), listeners);
+            if let Some(h) = hwnd {
+                taskbar::install(h, player.sender());
+            }
+            let loudness = background::spawn_loudness(app.handle().clone(), db.clone(), player.sender());
             let watch = background::spawn_watch(app.handle().clone());
             watch.set_folders(&prefs.watch_folders);
 
@@ -198,8 +300,12 @@ pub fn run() {
                 analyzer,
                 loudness,
                 watch,
+                discord,
+                lastfm,
+                update: Mutex::new(None),
             });
             build_tray(app.handle())?;
+            spawn_update_checks(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -229,6 +335,12 @@ pub fn run() {
             commands::playlist_delete,
             commands::playlist_set_tracks,
             commands::playlist_add_tracks,
+            commands::smart_playlists_get,
+            commands::smart_preview,
+            commands::smart_create,
+            commands::smart_update,
+            commands::smart_delete,
+            commands::smart_add_defaults,
             commands::lyrics_get,
             commands::lyrics_search,
             commands::lyrics_choose,
@@ -255,6 +367,20 @@ pub fn run() {
             commands::player_jump,
             commands::player_remove,
             commands::player_clear_upcoming,
+            commands::set_liked,
+            commands::audio_devices,
+            commands::year_stats,
+            commands::cover_bytes,
+            commands::save_image,
+            commands::open_link,
+            commands::lastfm_status,
+            commands::lastfm_connect,
+            commands::lastfm_disconnect,
+            commands::lastfm_set_keys,
+            commands::lastfm_clear_keys,
+            commands::discord_test,
+            commands::update_check,
+            commands::update_install,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Reson");

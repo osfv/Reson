@@ -16,6 +16,8 @@ pub struct NowPlayingInfo {
     pub title: String,
     pub artist: String,
     pub album: String,
+    pub album_id: i64,
+    pub album_artist: String,
     pub cover: Option<String>,
     pub duration: f64,
 }

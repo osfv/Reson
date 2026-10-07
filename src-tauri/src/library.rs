@@ -17,7 +17,7 @@ use walkdir::WalkDir;
 use crate::db::{AudioInfo, Db, TrackMeta};
 use crate::palette;
 
-pub const AUDIO_EXTS: &[&str] = &["mp3", "flac", "m4a", "mp4", "aac", "ogg", "oga", "wav"];
+pub const AUDIO_EXTS: &[&str] = &["mp3", "flac", "m4a", "mp4", "aac", "ogg", "oga", "opus", "wav", "ape", "wv"];
 const COVER_NAMES: &[&str] = &["cover", "folder", "front", "album", "albumart"];
 const COVER_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp"];
 
@@ -134,15 +134,30 @@ fn replaygain(v: Option<&str>) -> Option<f64> {
     v?.trim().trim_end_matches(|c: char| c.is_alphabetic() || c.is_whitespace()).trim().parse().ok()
 }
 
-/// Measures integrated loudness by decoding the whole file. Returns (LUFS, peak).
-pub fn measure_loudness(path: &Path) -> Option<(f64, f64)> {
+/// Decodes a file once and measures what's asked for: integrated loudness as (LUFS, peak), and
+/// the spectral cutoff used to spot lossless files made from lossy ones.
+pub fn analyze(path: &Path, format: Option<&str>, loudness: bool, cutoff: bool) -> (Option<(f64, f64)>, Option<i32>) {
     use rodio::Source;
-    let decoder = rodio::Decoder::try_from(File::open(path).ok()?).ok()?;
-    let mut meter = crate::dsp::LoudnessMeter::new(decoder.channels().get() as usize, decoder.sample_rate().get());
-    for s in decoder {
-        meter.push(s);
+    let Ok(source) = crate::decode::open(path, format) else { return (None, None) };
+    let channels = source.channels().get() as usize;
+    let rate = source.sample_rate().get();
+    let mut meter = loudness.then(|| crate::dsp::LoudnessMeter::new(channels, rate));
+    let mut spectrum = cutoff.then(|| crate::spectral::SpectrumAcc::new(rate));
+    let (mut mono, mut ch) = (0.0f32, 0usize);
+    for s in source {
+        if let Some(m) = &mut meter {
+            m.push(s);
+        }
+        if let Some(sp) = &mut spectrum {
+            mono += s;
+            ch += 1;
+            if ch == channels {
+                sp.push(mono / channels as f32);
+                (mono, ch) = (0.0, 0);
+            }
+        }
     }
-    meter.finish()
+    (meter.and_then(|m| m.finish()), spectrum.and_then(|s| s.finish()))
 }
 
 /// Reads tags and returns metadata plus the embedded front cover bytes, if any.

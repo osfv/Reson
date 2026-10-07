@@ -15,6 +15,7 @@ import { useUi } from "../store/ui";
 import { IconButton } from "./Buttons";
 import { Cover } from "./Cover";
 import { FormatBadge } from "./FormatBadge";
+import { LikeButton } from "./LikeButton";
 import { mislabeled, qualityLabel } from "../lib/format";
 import { Progress, Transport, Volume } from "./PlayerControls";
 
@@ -60,6 +61,7 @@ export function NowPlaying() {
   const lyricsOpen = useUi((s) => s.lyrics);
   const toggleLyrics = useUi((s) => s.toggleLyrics);
   const playing = usePlayer((s) => s.playing);
+  const output = usePlayer((s) => s.output);
   const bars = usePrefs((s) => s.ui.visualizer);
   const beatPulse = usePrefs((s) => s.ui.beatPulse);
   const reduce = useReducedMotion();
@@ -198,14 +200,17 @@ export function NowPlaying() {
                 animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
                 transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
               >
-                <h1
-                  className={cn(
-                    "line-clamp-2 pb-1 font-semibold leading-[1.08] tracking-tight",
-                    compact ? "text-3xl" : "text-4xl lg:text-5xl",
-                  )}
-                >
-                  {track.title}
-                </h1>
+                <div className="flex items-start justify-between gap-4">
+                  <h1
+                    className={cn(
+                      "line-clamp-2 pb-1 font-semibold leading-[1.08] tracking-tight",
+                      compact ? "text-3xl" : "text-4xl lg:text-5xl",
+                    )}
+                  >
+                    {track.title}
+                  </h1>
+                  <LikeButton trackId={track.id} size={compact ? 24 : 28} className={compact ? "mt-0.5 h-10 w-10" : "mt-1 h-11 w-11"} />
+                </div>
                 <button
                   type="button"
                   onClick={() => album && navigate({ name: "artist", artist: album.artist })}
@@ -236,6 +241,13 @@ export function NowPlaying() {
                       <span className="text-xs text-ink-muted">(file is named .{mislabeled(track)})</span>
                     )}
                   </button>
+                )}
+                {output && (
+                  <p className="mt-2 flex items-center gap-1.5 font-mono text-xs text-ink-muted" title="WASAPI exclusive mode">
+                    <span className={cn("h-1.5 w-1.5 rounded-full", output.bitPerfect ? "bg-accent" : "bg-ink-faint")} aria-hidden />
+                    Exclusive, {output.bits}-bit / {+(output.rate / 1000).toFixed(1)} kHz
+                    {output.bitPerfect ? ", bit-perfect" : ""}
+                  </p>
                 )}
               </motion.div>
             ) : (

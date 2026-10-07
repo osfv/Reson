@@ -1,13 +1,20 @@
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use tauri::ipc::{InvokeBody, Request, Response};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 
-use crate::db::{History, Library, Playlist};
-use crate::library;
+use crate::db::{History, Library, Playlist, SmartPlaylist, YearStats};
 use crate::lyrics::{self, Candidate, Lyrics};
+use crate::output::DeviceInfo;
 use crate::player::{Cmd, Repeat, Snapshot};
+use crate::updater::{self, UpdateInfo};
+use crate::library;
+use crate::smart::Rules;
 use crate::{AppState, Prefs};
 
 type Res<T> = Result<T, String>;
@@ -62,6 +69,39 @@ pub fn playlist_set_tracks(state: State<AppState>, id: i64, track_ids: Vec<i64>)
 #[tauri::command]
 pub fn playlist_add_tracks(state: State<AppState>, id: i64, track_ids: Vec<i64>) -> Res<()> {
     state.db.playlist_add_tracks(id, &track_ids).map_err(err)
+}
+
+#[tauri::command]
+pub fn smart_playlists_get(state: State<AppState>) -> Res<Vec<SmartPlaylist>> {
+    state.db.smart_playlists().map_err(err)
+}
+
+/// Live match list for the rule editor.
+#[tauri::command]
+pub fn smart_preview(state: State<AppState>, rules: Rules) -> Res<Vec<i64>> {
+    state.db.smart_tracks(&rules)
+}
+
+#[tauri::command]
+pub fn smart_create(state: State<AppState>, name: String, rules: Rules) -> Res<SmartPlaylist> {
+    state.db.smart_create(name.trim(), &rules)
+}
+
+#[tauri::command]
+pub fn smart_update(state: State<AppState>, id: i64, name: String, rules: Rules) -> Res<()> {
+    state.db.smart_update(id, name.trim(), &rules)
+}
+
+#[tauri::command]
+pub fn smart_delete(state: State<AppState>, id: i64) -> Res<()> {
+    state.db.smart_delete(id).map_err(err)
+}
+
+/// Opt-in suggestions; returns the full, re-evaluated list.
+#[tauri::command]
+pub fn smart_add_defaults(state: State<AppState>) -> Res<Vec<SmartPlaylist>> {
+    state.db.smart_add_defaults()?;
+    state.db.smart_playlists().map_err(err)
 }
 
 /// Network-bound, so it runs off the main thread.
@@ -134,6 +174,11 @@ pub fn prefs_set(state: State<AppState>, prefs: Prefs) {
     let folders_changed = state.prefs.lock().map(|p| p.watch_folders != prefs.watch_folders).unwrap_or(true);
     if folders_changed {
         state.watch.set_folders(&prefs.watch_folders);
+    }
+    state.discord.enabled.store(prefs.discord, Ordering::Relaxed);
+    state.discord.covers.store(prefs.discord_covers, Ordering::Relaxed);
+    if let Ok(mut id) = state.discord.app_id.lock() {
+        *id = prefs.discord_app_id.clone();
     }
     state.player.send(Cmd::Prefs(prefs.playback()));
     crate::save_prefs(&state.db, &prefs);
@@ -237,4 +282,138 @@ pub fn player_remove(state: State<AppState>, uid: u64) {
 #[tauri::command]
 pub fn player_clear_upcoming(state: State<AppState>) {
     state.player.send(Cmd::ClearUpcoming);
+}
+
+#[tauri::command]
+pub fn set_liked(state: State<AppState>, track_id: i64, liked: bool) -> Res<()> {
+    state.db.set_liked(track_id, liked).map_err(err)
+}
+
+#[tauri::command]
+pub async fn audio_devices() -> Vec<DeviceInfo> {
+    tauri::async_runtime::spawn_blocking(crate::output::devices).await.unwrap_or_default()
+}
+
+#[tauri::command]
+pub fn year_stats(state: State<AppState>, year: i32) -> Res<YearStats> {
+    state.db.year_stats(year).map_err(err)
+}
+
+/// Raw cover bytes, for drawing covers onto a canvas (the asset protocol would taint it).
+#[tauri::command]
+pub fn cover_bytes(state: State<AppState>, album_id: i64) -> Res<Response> {
+    let cover = state.db.album_cover(album_id).ok_or("No cover")?;
+    std::fs::read(cover).map(Response::new).map_err(err)
+}
+
+/// Asks where to save, then writes the PNG sent as the raw request body.
+/// The suggested file name comes in the `x-file-name` header.
+#[tauri::command]
+pub async fn save_image(app: AppHandle, request: Request<'_>) -> Res<bool> {
+    let InvokeBody::Raw(data) = request.body() else { return Err("Expected image bytes".into()) };
+    let data = data.clone();
+    let name = request
+        .headers()
+        .get("x-file-name")
+        .and_then(|v| v.to_str().ok())
+        .filter(|n| n.chars().all(|c| c.is_ascii_alphanumeric() || "-_ .".contains(c)))
+        .unwrap_or("Reson.png")
+        .to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(path) = app.dialog().file().add_filter("PNG image", &["png"]).set_file_name(&name).blocking_save_file() else {
+            return Ok(false);
+        };
+        let path = path.into_path().map_err(err)?;
+        std::fs::write(path, data).map_err(err)?;
+        Ok(true)
+    })
+    .await
+    .map_err(err)?
+}
+
+#[tauri::command]
+pub fn open_link(url: String) -> Res<()> {
+    crate::open_url(&url)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastFmStatus {
+    /// The user has entered their API key and secret.
+    configured: bool,
+    /// Last four characters of the key in use.
+    key_hint: Option<String>,
+    user: Option<String>,
+}
+
+#[tauri::command]
+pub fn lastfm_status(state: State<AppState>) -> LastFmStatus {
+    let l = &state.lastfm;
+    LastFmStatus { configured: l.configured(), key_hint: l.key_hint(), user: l.user() }
+}
+
+/// Validates the user's own API key and secret with Last.fm and stores them.
+#[tauri::command]
+pub async fn lastfm_set_keys(app: AppHandle, state: State<'_, AppState>, key: String, secret: String) -> Res<()> {
+    let lfm = state.lastfm.clone();
+    tauri::async_runtime::spawn_blocking(move || lfm.set_keys(&key, &secret)).await.map_err(err)??;
+    let _ = app.emit("lastfm:changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn lastfm_clear_keys(app: AppHandle, state: State<AppState>) {
+    state.lastfm.clear_keys();
+    let _ = app.emit("lastfm:changed", ());
+}
+
+/// Checks a Discord Application ID against the running Discord app. Returns the Discord user name.
+#[tauri::command]
+pub async fn discord_test(app_id: String) -> Res<String> {
+    tauri::async_runtime::spawn_blocking(move || crate::discord::test(app_id.trim())).await.map_err(err)?
+}
+
+/// Opens Last.fm's approval page and waits (up to 3 minutes) for the user to allow Reson.
+#[tauri::command]
+pub async fn lastfm_connect(app: AppHandle, state: State<'_, AppState>) -> Res<Option<String>> {
+    let lfm = state.lastfm.clone();
+    let user = tauri::async_runtime::spawn_blocking(move || -> Res<Option<String>> {
+        let (token, url) = lfm.begin_auth()?;
+        crate::open_url(&url)?;
+        let deadline = Instant::now() + Duration::from_secs(180);
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_secs(2));
+            if let Some(name) = lfm.finish_auth(&token)? {
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
+    })
+    .await
+    .map_err(err)??;
+    let _ = app.emit("lastfm:changed", ());
+    Ok(user)
+}
+
+#[tauri::command]
+pub fn lastfm_disconnect(app: AppHandle, state: State<AppState>) {
+    state.lastfm.disconnect();
+    let _ = app.emit("lastfm:changed", ());
+}
+
+#[tauri::command]
+pub async fn update_check(app: AppHandle, state: State<'_, AppState>) -> Res<Option<UpdateInfo>> {
+    let current = app.package_info().version.to_string();
+    let found = tauri::async_runtime::spawn_blocking(move || updater::check(&current)).await.map_err(err)??;
+    if let Ok(mut slot) = state.update.lock() {
+        *slot = found.clone();
+    }
+    Ok(found)
+}
+
+/// Downloads and runs the installer for the update found by the last check. Reson quits.
+#[tauri::command]
+pub async fn update_install(app: AppHandle, state: State<'_, AppState>) -> Res<()> {
+    let update = state.update.lock().ok().and_then(|u| u.clone()).ok_or("No update to install. Check again.")?;
+    tauri::async_runtime::spawn_blocking(move || updater::install(&app, &update)).await.map_err(err)?
 }

@@ -1,11 +1,11 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { api } from "./api";
+import { api, type SmartRules } from "./api";
 import { useLibrary } from "../store/library";
 import { watchFolders } from "../store/prefs";
 import { useUi, type MenuItem } from "../store/ui";
 import { plural } from "./format";
 
-const AUDIO_EXTS = ["mp3", "flac", "m4a", "mp4", "aac", "ogg", "oga", "wav"];
+const AUDIO_EXTS = ["mp3", "flac", "m4a", "mp4", "aac", "ogg", "oga", "opus", "wav", "ape", "wv"];
 
 const fail = (e: unknown) => useUi.getState().toast(String(e));
 
@@ -89,6 +89,61 @@ export function deletePlaylist(id: number) {
   api.playlistDelete(id).catch(fail);
 }
 
+export function likeTracks(ids: number[], liked: boolean) {
+  if (!ids.length) return;
+  useLibrary.getState().setLiked(ids, liked);
+  if (ids.length > 1 || !liked) {
+    useUi.getState().toast(liked ? `Added ${plural(ids.length, "song")} to Liked songs` : "Removed from Liked songs");
+  }
+}
+
+export async function saveSmartPlaylist(id: number | null, name: string, rules: SmartRules) {
+  const clean = name.trim() || "Smart playlist";
+  const lib = useLibrary.getState();
+  try {
+    if (id == null) {
+      const pl = await api.smartCreate(clean, rules);
+      lib.setSmartPlaylists([...useLibrary.getState().smartPlaylists, pl]);
+      useUi.getState().navigate({ name: "smart", id: pl.id });
+    } else {
+      await api.smartUpdate(id, clean, rules);
+      lib.refreshSmart();
+    }
+    return true;
+  } catch (e) {
+    fail(e);
+    return false;
+  }
+}
+
+export function deleteSmartPlaylist(id: number) {
+  const lib = useLibrary.getState();
+  lib.setSmartPlaylists(lib.smartPlaylists.filter((p) => p.id !== id));
+  const ui = useUi.getState();
+  if (ui.route.name === "smart" && ui.route.id === id) ui.navigate({ name: "albums" });
+  api.smartDelete(id).catch(fail);
+}
+
+export function smartPlaylistMenu(id: number): MenuItem[] {
+  return [
+    { label: "Edit rules", onSelect: () => useUi.getState().editSmart(id) },
+    { label: "Delete smart playlist", danger: true, onSelect: () => deleteSmartPlaylist(id) },
+  ];
+}
+
+/** Opt-in: adds Most played, Recently added and the other suggestions the user doesn't have yet. */
+export async function addSuggestedSmartPlaylists() {
+  const before = useLibrary.getState().smartPlaylists.length;
+  try {
+    const list = await api.smartAddDefaults();
+    useLibrary.getState().setSmartPlaylists(list);
+    const added = list.length - before;
+    useUi.getState().toast(added ? `Added ${plural(added, "smart playlist")}` : "You already have all the suggestions");
+  } catch (e) {
+    fail(e);
+  }
+}
+
 export async function removeFromLibrary(ids: number[]) {
   try {
     await api.removeTracks(ids);
@@ -100,14 +155,19 @@ export async function removeFromLibrary(ids: number[]) {
 
 /** Context menu for one or more tracks. `playlist` adds playlist-specific entries. */
 export function trackMenu(ids: number[], opts: { playlistId?: number; positions?: number[] } = {}): MenuItem[] {
-  const { playlists, trackById, albumById } = useLibrary.getState();
+  const { playlists, trackById, albumById, likedSet } = useLibrary.getState();
   const { navigate } = useUi.getState();
   const single = ids.length === 1 ? trackById.get(ids[0]) : undefined;
   const album = single ? albumById.get(single.albumId) : undefined;
+  const allLiked = ids.every((id) => likedSet.has(id));
 
   const items: MenuItem[] = [
     { label: "Play next", onSelect: () => enqueue(ids, true) },
     { label: "Add to queue", onSelect: () => enqueue(ids, false) },
+    {
+      label: allLiked ? "Remove from Liked songs" : "Save to Liked songs",
+      onSelect: () => likeTracks(ids, !allLiked),
+    },
     {
       label: "Add to playlist",
       submenu: [

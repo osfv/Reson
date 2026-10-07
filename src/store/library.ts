@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api, type Album, type Library, type Playlist, type ScanProgress, type Track } from "../lib/api";
+import { api, type Album, type Library, type Playlist, type ScanProgress, type SmartPlaylist, type Track } from "../lib/api";
 
 export interface Artist {
   name: string;
@@ -13,21 +13,32 @@ interface LibraryState {
   tracks: Track[];
   albums: Album[];
   playlists: Playlist[];
+  smartPlaylists: SmartPlaylist[];
   trackById: Map<number, Track>;
   albumById: Map<number, Album>;
   albumTracks: Map<number, Track[]>;
   artists: Artist[];
   artistByName: Map<string, Artist>;
+  /** Liked track ids, most recent first. */
+  liked: number[];
+  likedSet: Set<number>;
   scan: ScanProgress | null;
   refresh: () => Promise<void>;
   setScan: (scan: ScanProgress) => void;
   setPlaylists: (fn: (p: Playlist[]) => Playlist[]) => void;
+  /** Likes or unlikes tracks (optimistic). */
+  setLiked: (ids: number[], liked: boolean) => void;
+  /** Applies background spectral-check results without reloading the library. */
+  patchCutoffs: (results: { id: number; cutoffHz: number }[]) => void;
+  setSmartPlaylists: (list: SmartPlaylist[]) => void;
+  /** Re-evaluates smart playlists only, e.g. after a play changes play counts. */
+  refreshSmart: () => void;
 }
 
 const byDiscTrack = (a: Track, b: Track) =>
   (a.discNo ?? 1) - (b.discNo ?? 1) || (a.trackNo ?? 1e6) - (b.trackNo ?? 1e6) || a.title.localeCompare(b.title);
 
-function index(lib: Library) {
+function index(lib: Pick<Library, "tracks" | "albums">) {
   const trackById = new Map(lib.tracks.map((t) => [t.id, t]));
   const albumById = new Map(lib.albums.map((a) => [a.id, a]));
   const albumTracks = new Map<number, Track[]>();
@@ -54,28 +65,61 @@ function index(lib: Library) {
   return { trackById, albumById, albumTracks, artists, artistByName };
 }
 
-export const useLibrary = create<LibraryState>((set) => ({
+export const useLibrary = create<LibraryState>((set, get) => ({
   loaded: false,
   error: null,
   tracks: [],
   albums: [],
   playlists: [],
+  smartPlaylists: [],
   trackById: new Map(),
   albumById: new Map(),
   albumTracks: new Map(),
   artists: [],
   artistByName: new Map(),
+  liked: [],
+  likedSet: new Set(),
   scan: null,
   refresh: async () => {
     try {
       const lib = await api.library();
-      set({ loaded: true, error: null, tracks: lib.tracks, albums: lib.albums, playlists: lib.playlists, ...index(lib) });
+      set({
+        loaded: true,
+        error: null,
+        tracks: lib.tracks,
+        albums: lib.albums,
+        playlists: lib.playlists,
+        liked: lib.liked,
+        likedSet: new Set(lib.liked),
+        smartPlaylists: lib.smartPlaylists,
+        ...index(lib),
+      });
     } catch (e) {
       set({ loaded: true, error: String(e) });
     }
   },
   setScan: (scan) => set({ scan }),
   setPlaylists: (fn) => set((s) => ({ playlists: fn(s.playlists) })),
+  setLiked: (ids, liked) => {
+    const { liked: order } = get();
+    const changed = new Set(ids);
+    const next = liked ? [...ids.filter((id) => !order.includes(id)).reverse(), ...order] : order.filter((id) => !changed.has(id));
+    set({ liked: next, likedSet: new Set(next) });
+    for (const id of ids) api.setLiked(id, liked).catch(() => get().refresh());
+  },
+  patchCutoffs: (results) => {
+    const { tracks, albumById } = get();
+    const byId = new Map(results.map((r) => [r.id, r.cutoffHz]));
+    const next = tracks.map((t) => (byId.has(t.id) ? { ...t, cutoffHz: byId.get(t.id)! } : t));
+    set({ tracks: next, ...index({ tracks: next, albums: [...albumById.values()] }) });
+  },
+  setSmartPlaylists: (smartPlaylists) => set({ smartPlaylists }),
+  refreshSmart: () => {
+    api
+      .smartPlaylists()
+      .then((smartPlaylists) => set({ smartPlaylists }))
+      .catch(() => {});
+  },
 }));
 
 export const albumCovers = (tracks: Track[], albumById: Map<number, Album>, max = 4): Album[] => {

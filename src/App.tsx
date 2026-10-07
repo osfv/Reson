@@ -26,6 +26,10 @@ import { SongsView } from "./views/SongsView";
 import { ArtistsView } from "./views/ArtistsView";
 import { ArtistView } from "./views/ArtistView";
 import { PlaylistView } from "./views/PlaylistView";
+import { LikedView } from "./views/LikedView";
+import { YearView } from "./views/YearView";
+import { SmartPlaylistView } from "./views/SmartPlaylistView";
+import { SmartEditor } from "./components/SmartEditor";
 import { SearchView } from "./views/SearchView";
 import { EmptyLibrary } from "./views/EmptyLibrary";
 import { LibrarySkeleton } from "./views/LibrarySkeleton";
@@ -38,6 +42,8 @@ function View() {
   if (route.name === "settings") return <SettingsView />;
   if (!loaded) return <LibrarySkeleton />;
   if (route.name === "playlist") return <PlaylistView id={route.id} rename={route.rename} />;
+  if (route.name === "liked") return <LikedView />;
+  if (route.name === "smart") return <SmartPlaylistView id={route.id} />;
   if (empty) return <EmptyLibrary />;
   switch (route.name) {
     case "home":
@@ -54,6 +60,8 @@ function View() {
       return <ArtistView name={route.artist} />;
     case "search":
       return <SearchView />;
+    case "year":
+      return <YearView year={route.year} />;
   }
 }
 
@@ -84,6 +92,7 @@ export default function App() {
   const queueOpen = useUi((s) => s.queueOpen);
   const nowPlaying = useUi((s) => s.nowPlaying);
   const info = useUi((s) => s.info);
+  const smartEditor = useUi((s) => s.smartEditor);
   const { album } = useCurrentTrack();
 
   useBridge(useCallback((over: boolean) => setDragging(over), []));
@@ -134,6 +143,7 @@ export default function App() {
       <PlayerBar />
       <AnimatePresence>{nowPlaying && <NowPlaying key="np" />}</AnimatePresence>
       <AnimatePresence>{info != null && <SongInfo key="info" id={info} />}</AnimatePresence>
+      <AnimatePresence>{smartEditor && <SmartEditor key="smart" id={smartEditor.id} />}</AnimatePresence>
       <ContextMenu />
       <Toasts />
       <DragLayer />

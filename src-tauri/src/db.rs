@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::lyrics::{Lyrics, LyricsQuery};
 use crate::media::NowPlayingInfo;
 use crate::palette::Palette;
+use crate::smart::{self, Rules};
 
 pub struct Db(Mutex<Connection>);
 
@@ -26,6 +27,9 @@ pub struct Track {
     pub added_at: i64,
     #[serde(flatten)]
     pub audio: AudioInfo,
+    /// Spectral check of lossless files: None = not checked yet, -1 = couldn't tell, 0 = full
+    /// bandwidth, otherwise the frequency (Hz) where the audio stops.
+    pub cutoff_hz: Option<i32>,
 }
 
 /// What the file actually contains, detected from its bytes rather than its extension.
@@ -62,11 +66,26 @@ pub struct Playlist {
     pub track_ids: Vec<i64>,
 }
 
+/// A rule-based playlist. `track_ids` is evaluated from the rules on every read.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartPlaylist {
+    pub id: i64,
+    pub name: String,
+    pub created_at: i64,
+    pub rules: Rules,
+    pub track_ids: Vec<i64>,
+}
+
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Library {
     pub tracks: Vec<Track>,
     pub albums: Vec<Album>,
     pub playlists: Vec<Playlist>,
+    /// Liked track ids, most recently liked first.
+    pub liked: Vec<i64>,
+    pub smart_playlists: Vec<SmartPlaylist>,
 }
 
 /// Fields read from a file's tags, ready to be written to the library.
@@ -102,7 +121,14 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // Files that vanished (moved, deleted, drive unplugged). Hidden, never deleted automatically,
     // so lyrics offsets, history and playlists survive until the file is found again.
     ("tracks", "missing", "INTEGER NOT NULL DEFAULT 0"),
+    ("tracks", "cutoff_hz", "INTEGER"),
+    // Public artwork URL for the Discord status (looked up once per album).
+    ("albums", "art_url", "TEXT"),
+    ("albums", "art_checked", "INTEGER"),
 ];
+
+/// Formats whose spectrum is worth checking for signs of a lossy source.
+const LOSSLESS_SQL: &str = "('FLAC', 'ALAC', 'WAV', 'AIFF', 'APE', 'WavPack')";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct QueueSource {
@@ -113,6 +139,51 @@ pub struct QueueSource {
     pub loudness: Option<f64>,
     #[serde(default)]
     pub peak: Option<f64>,
+    /// Detected format; picks the decoder.
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub bit_depth: Option<u8>,
+}
+
+/// A listen waiting to be sent to Last.fm.
+pub struct PendingScrobble {
+    pub id: i64,
+    pub artist: String,
+    pub title: String,
+    pub album: String,
+    pub album_artist: String,
+    pub duration: f64,
+    pub played_at: i64,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct YearStats {
+    pub year: i32,
+    /// Years with any listening, newest first.
+    pub years: Vec<i32>,
+    pub plays: i64,
+    pub minutes: f64,
+    pub songs: i64,
+    pub artists: i64,
+    pub albums: i64,
+    /// (track id, plays, minutes)
+    pub top_tracks: Vec<(i64, i64, f64)>,
+    /// (album id, plays, minutes)
+    pub top_albums: Vec<(i64, i64, f64)>,
+    /// (album artist, plays, minutes)
+    pub top_artists: Vec<(String, i64, f64)>,
+    pub top_genres: Vec<(String, i64)>,
+    /// Minutes listened in each month, January first.
+    pub months: Vec<f64>,
+    /// ("2026-03-14", minutes)
+    pub top_day: Option<(String, f64)>,
+    pub longest_streak: i64,
+    /// (track id, "2026-01-01")
+    pub first_track: Option<(i64, String)>,
+    pub liked: i64,
+    pub new_songs: i64,
 }
 
 #[derive(Serialize)]
@@ -124,6 +195,29 @@ pub struct History {
     pub recent_tracks: Vec<i64>,
     /// (track id, play count) over the last 90 days, most played first.
     pub top_tracks: Vec<(i64, i64)>,
+}
+
+/// Days since 1970-01-01 for a "YYYY-MM-DD" date (proleptic Gregorian).
+fn day_number(date: &str) -> Option<i64> {
+    let mut it = date.split('-').map(|p| p.parse::<i64>().ok());
+    let (y, m, d) = (it.next()??, it.next()??, it.next()??);
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+/// Longest run of consecutive days in a sorted list of dates.
+fn longest_streak<'a>(dates: impl Iterator<Item = &'a str>) -> i64 {
+    let (mut best, mut run, mut prev) = (0, 0, None::<i64>);
+    for day in dates.filter_map(day_number) {
+        run = if prev == Some(day - 1) { run + 1 } else { 1 };
+        best = best.max(run);
+        prev = Some(day);
+    }
+    best
 }
 
 pub fn now() -> i64 {
@@ -183,6 +277,26 @@ CREATE TABLE IF NOT EXISTS plays (
   played_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS plays_time ON plays(played_at);
+CREATE TABLE IF NOT EXISTS likes (
+  track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+  liked_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS scrobbles (
+  id INTEGER PRIMARY KEY,
+  artist TEXT NOT NULL,
+  title TEXT NOT NULL,
+  album TEXT NOT NULL,
+  album_artist TEXT NOT NULL,
+  duration REAL NOT NULL,
+  played_at INTEGER NOT NULL
+);
+-- Smart playlists store their definition (smart::Rules as JSON), never their tracks.
+CREATE TABLE IF NOT EXISTS smart_playlists (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  rules TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -216,7 +330,7 @@ impl Db {
         let tracks = conn
             .prepare(
                 "SELECT id, path, title, artist, album_id, track_no, disc_no, duration, genre, added_at,
-                   format, sample_rate, bit_depth, bitrate, channels, size
+                   format, sample_rate, bit_depth, bitrate, channels, size, cutoff_hz
                  FROM tracks WHERE missing = 0
                  ORDER BY artist COLLATE NOCASE, album_id, disc_no, track_no, title COLLATE NOCASE",
             )?
@@ -240,6 +354,7 @@ impl Db {
                         channels: r.get(14)?,
                         size: r.get(15)?,
                     },
+                    cutoff_hz: r.get(16)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -260,8 +375,209 @@ impl Db {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let liked = conn
+            .prepare("SELECT track_id FROM likes ORDER BY liked_at DESC, rowid DESC")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(conn);
-        Ok(Library { tracks, albums, playlists: self.playlists()? })
+        Ok(Library { tracks, albums, playlists: self.playlists()?, liked, smart_playlists: self.smart_playlists()? })
+    }
+
+    pub fn set_liked(&self, track_id: i64, liked: bool) -> rusqlite::Result<()> {
+        let conn = self.conn();
+        if liked {
+            conn.execute("INSERT OR IGNORE INTO likes (track_id, liked_at) VALUES (?1, ?2)", params![track_id, now()])?;
+        } else {
+            conn.execute("DELETE FROM likes WHERE track_id = ?", [track_id])?;
+        }
+        Ok(())
+    }
+
+    /// Lossless tracks whose spectrum hasn't been checked yet, newest first.
+    pub fn tracks_missing_cutoff(&self, limit: usize) -> rusqlite::Result<Vec<i64>> {
+        self.conn()
+            .prepare(&format!(
+                "SELECT id FROM tracks WHERE cutoff_hz IS NULL AND missing = 0 AND format IN {LOSSLESS_SQL}
+                 ORDER BY added_at DESC LIMIT ?"
+            ))?
+            .query_map([limit as i64], |r| r.get(0))?
+            .collect()
+    }
+
+    /// (path, format, needs loudness, needs a spectral check)
+    pub fn analysis_job(&self, id: i64) -> Option<(String, Option<String>, bool, bool)> {
+        self.conn()
+            .query_row(
+                &format!(
+                    "SELECT path, format, loudness IS NULL, cutoff_hz IS NULL AND format IN {LOSSLESS_SQL}
+                     FROM tracks WHERE id = ?"
+                ),
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn set_cutoff(&self, id: i64, cutoff_hz: i32) -> rusqlite::Result<()> {
+        self.conn().execute("UPDATE tracks SET cutoff_hz = ?1 WHERE id = ?2", params![cutoff_hz, id])?;
+        Ok(())
+    }
+
+    pub fn album_cover(&self, album_id: i64) -> Option<String> {
+        self.conn().query_row("SELECT cover FROM albums WHERE id = ?", [album_id], |r| r.get(0)).ok().flatten()
+    }
+
+    /// The cached public artwork URL for an album, and when it was looked up (None = never).
+    pub fn album_art_url(&self, album_id: i64) -> (Option<String>, Option<i64>) {
+        self.conn()
+            .query_row("SELECT art_url, art_checked FROM albums WHERE id = ?", [album_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap_or((None, None))
+    }
+
+    pub fn set_album_art_url(&self, album_id: i64, url: Option<&str>) -> rusqlite::Result<()> {
+        self.conn()
+            .execute("UPDATE albums SET art_url = ?1, art_checked = ?2 WHERE id = ?3", params![url, now(), album_id])?;
+        Ok(())
+    }
+
+    pub fn queue_scrobble(&self, s: &PendingScrobble) -> rusqlite::Result<()> {
+        self.conn().execute(
+            "INSERT INTO scrobbles (artist, title, album, album_artist, duration, played_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![s.artist, s.title, s.album, s.album_artist, s.duration, s.played_at],
+        )?;
+        Ok(())
+    }
+
+    /// Oldest first; Last.fm takes up to 50 per request.
+    pub fn pending_scrobbles(&self, limit: usize) -> rusqlite::Result<Vec<PendingScrobble>> {
+        self.conn()
+            .prepare("SELECT id, artist, title, album, album_artist, duration, played_at FROM scrobbles ORDER BY played_at LIMIT ?")?
+            .query_map([limit as i64], |r| {
+                Ok(PendingScrobble {
+                    id: r.get(0)?,
+                    artist: r.get(1)?,
+                    title: r.get(2)?,
+                    album: r.get(3)?,
+                    album_artist: r.get(4)?,
+                    duration: r.get(5)?,
+                    played_at: r.get(6)?,
+                })
+            })?
+            .collect()
+    }
+
+    pub fn remove_scrobbles(&self, ids: &[i64]) -> rusqlite::Result<()> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("DELETE FROM scrobbles WHERE id = ?")?;
+        for id in ids {
+            stmt.execute([id])?;
+        }
+        Ok(())
+    }
+
+    /// Listening stats for one calendar year (local time).
+    pub fn year_stats(&self, year: i32) -> rusqlite::Result<YearStats> {
+        let conn = self.conn();
+        let y = year.to_string();
+        // Every play joined with what was played, limited to the year.
+        let base = "FROM plays p JOIN tracks t ON t.id = p.track_id JOIN albums a ON a.id = t.album_id
+                    WHERE strftime('%Y', p.played_at, 'unixepoch', 'localtime') = ?1";
+        let years = conn
+            .prepare(
+                "SELECT DISTINCT CAST(strftime('%Y', played_at, 'unixepoch', 'localtime') AS INTEGER) AS y
+                 FROM plays ORDER BY y DESC",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<i32>>>()?;
+        let (plays, minutes, songs, artists, albums): (i64, f64, i64, i64, i64) = conn.query_row(
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(t.duration), 0) / 60.0, COUNT(DISTINCT t.id),
+                   COUNT(DISTINCT a.artist), COUNT(DISTINCT a.id) {base}"
+            ),
+            [&y],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
+        let top_tracks = conn
+            .prepare(&format!(
+                "SELECT t.id, COUNT(*) AS n, SUM(t.duration) / 60.0 {base} GROUP BY t.id ORDER BY n DESC, MAX(p.played_at) DESC LIMIT 10"
+            ))?
+            .query_map([&y], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let top_albums = conn
+            .prepare(&format!(
+                "SELECT a.id, COUNT(*) AS n, SUM(t.duration) / 60.0 AS m {base} GROUP BY a.id ORDER BY m DESC LIMIT 6"
+            ))?
+            .query_map([&y], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let top_artists = conn
+            .prepare(&format!(
+                "SELECT a.artist, COUNT(*) AS n, SUM(t.duration) / 60.0 AS m {base} GROUP BY a.artist ORDER BY m DESC LIMIT 6"
+            ))?
+            .query_map([&y], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let top_genres = conn
+            .prepare(&format!(
+                "SELECT t.genre, COUNT(*) AS n {base} AND t.genre IS NOT NULL AND t.genre != '' GROUP BY t.genre COLLATE NOCASE
+                 ORDER BY n DESC LIMIT 5"
+            ))?
+            .query_map([&y], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut months = vec![0.0; 12];
+        let mut stmt = conn.prepare(&format!(
+            "SELECT CAST(strftime('%m', p.played_at, 'unixepoch', 'localtime') AS INTEGER), SUM(t.duration) / 60.0 {base} GROUP BY 1"
+        ))?;
+        for row in stmt.query_map([&y], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))? {
+            let (m, mins) = row?;
+            if (1..=12).contains(&m) {
+                months[m as usize - 1] = mins;
+            }
+        }
+        let days: Vec<(String, f64)> = conn
+            .prepare(&format!(
+                "SELECT date(p.played_at, 'unixepoch', 'localtime') AS d, SUM(t.duration) / 60.0 {base} GROUP BY d ORDER BY d"
+            ))?
+            .query_map([&y], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let top_day = days.iter().cloned().max_by(|a, b| a.1.total_cmp(&b.1));
+        let longest_streak = longest_streak(days.iter().map(|(d, _)| d.as_str()));
+        let first_track = conn
+            .query_row(
+                &format!("SELECT t.id, date(p.played_at, 'unixepoch', 'localtime') {base} ORDER BY p.played_at LIMIT 1"),
+                [&y],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let liked = conn.query_row(
+            "SELECT COUNT(*) FROM likes WHERE strftime('%Y', liked_at, 'unixepoch', 'localtime') = ?1",
+            [&y],
+            |r| r.get(0),
+        )?;
+        let new_songs = conn.query_row(
+            "SELECT COUNT(*) FROM tracks WHERE missing = 0 AND strftime('%Y', added_at, 'unixepoch', 'localtime') = ?1",
+            [&y],
+            |r| r.get(0),
+        )?;
+        Ok(YearStats {
+            year,
+            years,
+            plays,
+            minutes,
+            songs,
+            artists,
+            albums,
+            top_tracks,
+            top_albums,
+            top_artists,
+            top_genres,
+            months,
+            top_day,
+            longest_streak,
+            first_track,
+            liked,
+            new_songs,
+        })
     }
 
     pub fn playlists(&self) -> rusqlite::Result<Vec<Playlist>> {
@@ -277,6 +593,84 @@ impl Db {
             p.track_ids = stmt.query_map([p.id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         }
         Ok(playlists)
+    }
+
+    /// Track ids matching `rules`, in playlist order.
+    pub fn smart_tracks(&self, rules: &Rules) -> Result<Vec<i64>, String> {
+        let (sql, params) = rules.compile(now())?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+        let ids = stmt
+            .query_map(rusqlite::params_from_iter(params), |r| r.get(0))
+            .and_then(|rows| rows.collect::<rusqlite::Result<_>>())
+            .map_err(|e| e.to_string())?;
+        Ok(rules.finish(ids))
+    }
+
+    /// All smart playlists with their current tracks. Definitions this version can't read (e.g. written
+    /// by a newer Reson) are skipped rather than failing the whole library.
+    pub fn smart_playlists(&self) -> rusqlite::Result<Vec<SmartPlaylist>> {
+        let rows: Vec<(i64, String, String, i64)> = self
+            .conn()
+            .prepare("SELECT id, name, rules, created_at FROM smart_playlists ORDER BY created_at, id")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, name, json, created_at)| {
+                let rules: Rules = serde_json::from_str(&json).ok()?;
+                let track_ids = self.smart_tracks(&rules).unwrap_or_default();
+                Some(SmartPlaylist { id, name, created_at, rules, track_ids })
+            })
+            .collect())
+    }
+
+    pub fn smart_create(&self, name: &str, rules: &Rules) -> Result<SmartPlaylist, String> {
+        rules.validate()?;
+        let json = serde_json::to_string(rules).map_err(|e| e.to_string())?;
+        let created_at = now();
+        let id = {
+            let conn = self.conn();
+            conn.execute(
+                "INSERT INTO smart_playlists (name, rules, created_at) VALUES (?1, ?2, ?3)",
+                params![name, json, created_at],
+            )
+            .map_err(|e| e.to_string())?;
+            conn.last_insert_rowid()
+        };
+        let track_ids = self.smart_tracks(rules)?;
+        Ok(SmartPlaylist { id, name: name.into(), created_at, rules: rules.clone(), track_ids })
+    }
+
+    pub fn smart_update(&self, id: i64, name: &str, rules: &Rules) -> Result<(), String> {
+        rules.validate()?;
+        let json = serde_json::to_string(rules).map_err(|e| e.to_string())?;
+        self.conn()
+            .execute("UPDATE smart_playlists SET name = ?1, rules = ?2 WHERE id = ?3", params![name, json, id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn smart_delete(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn().execute("DELETE FROM smart_playlists WHERE id = ?", [id])?;
+        Ok(())
+    }
+
+    /// Adds the suggested smart playlists the user doesn't already have (matched by name).
+    pub fn smart_add_defaults(&self) -> Result<usize, String> {
+        let existing: Vec<String> = self
+            .conn()
+            .prepare("SELECT name FROM smart_playlists")
+            .and_then(|mut s| s.query_map([], |r| r.get(0))?.collect())
+            .map_err(|e| e.to_string())?;
+        let mut added = 0;
+        for (name, rules) in smart::defaults() {
+            if !existing.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                self.smart_create(name, &rules)?;
+                added += 1;
+            }
+        }
+        Ok(added)
     }
 
     /// Returns the stored mtime for a fully-scanned path, used to skip unchanged files on re-import.
@@ -440,6 +834,7 @@ impl Db {
         for (old, new) in &pairs {
             tx.execute("UPDATE plays SET track_id = ?1 WHERE track_id = ?2", params![new, old])?;
             tx.execute("UPDATE playlist_tracks SET track_id = ?1 WHERE track_id = ?2", params![new, old])?;
+            tx.execute("UPDATE OR IGNORE likes SET track_id = ?1 WHERE track_id = ?2", params![new, old])?;
             tx.execute(
                 "INSERT OR IGNORE INTO lyrics (track_id, synced, plain, instrumental, source, fetched_at, offset_ms)
                  SELECT ?1, synced, plain, instrumental, source, fetched_at, offset_ms FROM lyrics WHERE track_id = ?2",
@@ -458,12 +853,21 @@ impl Db {
 
     pub fn queue_sources(&self, ids: &[i64]) -> rusqlite::Result<Vec<QueueSource>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare_cached("SELECT path, duration, loudness, peak FROM tracks WHERE id = ?")?;
+        let mut stmt =
+            conn.prepare_cached("SELECT path, duration, loudness, peak, format, bit_depth FROM tracks WHERE id = ?")?;
         let mut out = Vec::with_capacity(ids.len());
         for &id in ids {
             if let Some(src) = stmt
                 .query_row([id], |r| {
-                    Ok(QueueSource { id, path: r.get(0)?, duration: r.get(1)?, loudness: r.get(2)?, peak: r.get(3)? })
+                    Ok(QueueSource {
+                        id,
+                        path: r.get(0)?,
+                        duration: r.get(1)?,
+                        loudness: r.get(2)?,
+                        peak: r.get(3)?,
+                        format: r.get(4)?,
+                        bit_depth: r.get(5)?,
+                    })
                 })
                 .optional()?
             {
@@ -471,6 +875,39 @@ impl Db {
             }
         }
         Ok(out)
+    }
+
+    /// Every playable song with what autoplay scores it on.
+    pub fn autoplay_candidates(&self) -> rusqlite::Result<Vec<crate::autoplay::Candidate>> {
+        self.conn()
+            .prepare(
+                "SELECT t.id, t.artist, a.artist, t.album_id, t.genre, a.year, COALESCE(p.n, 0), l.track_id IS NOT NULL
+                 FROM tracks t JOIN albums a ON a.id = t.album_id
+                 LEFT JOIN (SELECT track_id, COUNT(*) AS n FROM plays GROUP BY track_id) p ON p.track_id = t.id
+                 LEFT JOIN likes l ON l.track_id = t.id
+                 WHERE t.missing = 0",
+            )?
+            .query_map([], |r| {
+                Ok(crate::autoplay::Candidate {
+                    id: r.get(0)?,
+                    artist: r.get(1)?,
+                    album_artist: r.get(2)?,
+                    album_id: r.get(3)?,
+                    genre: r.get(4)?,
+                    year: r.get(5)?,
+                    plays: r.get(6)?,
+                    liked: r.get(7)?,
+                })
+            })?
+            .collect()
+    }
+
+    /// The `limit` most recently played distinct songs.
+    pub fn recent_plays(&self, limit: usize) -> rusqlite::Result<Vec<i64>> {
+        self.conn()
+            .prepare("SELECT track_id FROM plays GROUP BY track_id ORDER BY MAX(played_at) DESC LIMIT ?")?
+            .query_map([limit as i64], |r| r.get(0))?
+            .collect()
     }
 
     /// Tracks still needing a loudness measurement, in the order given (queue first), then the rest.
@@ -579,7 +1016,7 @@ impl Db {
     pub fn now_playing_info(&self, id: i64) -> rusqlite::Result<Option<NowPlayingInfo>> {
         self.conn()
             .query_row(
-                "SELECT t.title, t.artist, a.title, a.cover, t.duration
+                "SELECT t.title, t.artist, a.title, a.cover, t.duration, a.id, a.artist
                  FROM tracks t JOIN albums a ON a.id = t.album_id WHERE t.id = ?",
                 [id],
                 |r| {
@@ -589,6 +1026,8 @@ impl Db {
                         album: r.get(2)?,
                         cover: r.get(3)?,
                         duration: r.get(4)?,
+                        album_id: r.get(5)?,
+                        album_artist: r.get(6)?,
                     })
                 },
             )
@@ -673,6 +1112,11 @@ impl Db {
             .flatten()
     }
 
+    #[cfg(test)]
+    pub fn exec_for_test(&self, sql: &str) {
+        self.conn().execute_batch(sql).unwrap();
+    }
+
     pub fn set_setting(&self, key: &str, value: &str) -> rusqlite::Result<()> {
         self.conn().execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -712,6 +1156,65 @@ mod tests {
             loudness: None,
             peak: None,
         }
+    }
+
+    #[test]
+    fn streaks_count_consecutive_days() {
+        assert_eq!(day_number("1970-01-01"), Some(0));
+        assert_eq!(day_number("2000-03-01"), Some(11_017));
+        let days = ["2026-02-27", "2026-02-28", "2026-03-01", "2026-03-05", "2026-03-06"];
+        assert_eq!(longest_streak(days.into_iter()), 3);
+        assert_eq!(longest_streak(std::iter::empty()), 0);
+    }
+
+    #[test]
+    fn opening_an_older_database_adds_smart_playlists_and_keeps_data() {
+        let dir = std::env::temp_dir().join(format!("reson-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            // The v0.1.0 layout: no smart_playlists table and none of the later track columns.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE albums (id INTEGER PRIMARY KEY, title TEXT NOT NULL, artist TEXT NOT NULL, year INTEGER,
+                   cover TEXT, palette TEXT, UNIQUE (title, artist));
+                 CREATE TABLE tracks (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
+                   artist TEXT NOT NULL, album_id INTEGER NOT NULL REFERENCES albums(id), track_no INTEGER,
+                   disc_no INTEGER, duration REAL NOT NULL, genre TEXT, mtime INTEGER NOT NULL, added_at INTEGER NOT NULL);
+                 CREATE TABLE playlists (id INTEGER PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL);
+                 CREATE TABLE playlist_tracks (playlist_id INTEGER NOT NULL, track_id INTEGER NOT NULL, position INTEGER NOT NULL);
+                 CREATE TABLE plays (track_id INTEGER NOT NULL, played_at INTEGER NOT NULL);
+                 INSERT INTO albums (id, title, artist, year) VALUES (1, 'Album', 'Artist', 2001);
+                 INSERT INTO tracks VALUES (1, 'x.flac', 'Song', 'Artist', 1, 1, 1, 180, NULL, 1, 1);
+                 INSERT INTO playlists VALUES (1, 'Mine', 1);
+                 INSERT INTO playlist_tracks VALUES (1, 1, 0);
+                 INSERT INTO plays VALUES (1, 5), (1, 6);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let lib = db.library().unwrap();
+        assert_eq!(lib.tracks.len(), 1);
+        assert_eq!(lib.playlists[0].track_ids, vec![1]);
+        assert!(lib.smart_playlists.is_empty());
+
+        let rules: Rules = serde_json::from_str(
+            r#"{"match":"all","rules":[{"field":"plays","op":"gt","value":1},{"field":"year","op":"is","value":2001}]}"#,
+        )
+        .unwrap();
+        let created = db.smart_create("Played", &rules).unwrap();
+        assert_eq!(created.track_ids, vec![1]);
+        drop(db);
+
+        // Reopening is a no-op migration and the definition survives.
+        let db = Db::open(&path).unwrap();
+        let smart = db.smart_playlists().unwrap();
+        assert_eq!(smart.len(), 1);
+        assert_eq!(smart[0].rules, rules);
+        assert_eq!(smart[0].track_ids, vec![1]);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

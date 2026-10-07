@@ -1,55 +1,14 @@
-import type { ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowClockwise, FolderSimple, FolderSimplePlus, PictureInPicture, X } from "@phosphor-icons/react";
-import { motion } from "motion/react";
 import { PillButton } from "../components/Buttons";
+import { AboutSettings } from "../components/settings/About";
+import { EqualizerSettings } from "../components/settings/Equalizer";
+import { IntegrationSettings } from "../components/settings/Integrations";
+import { OutputSettings } from "../components/settings/Output";
+import { Group, Row, Toggle } from "../components/settings/parts";
 import { api } from "../lib/api";
-import { cn } from "../lib/cn";
 import { usePrefs, watchFolders } from "../store/prefs";
 import { useUi } from "../store/ui";
-
-function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label: string }) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      onClick={() => onChange(!checked)}
-      className={cn(
-        "relative h-6 w-11 shrink-0 rounded-full transition-colors duration-200",
-        checked ? "bg-accent" : "bg-white/15",
-      )}
-    >
-      <motion.span
-        layout
-        transition={{ type: "spring", stiffness: 700, damping: 35 }}
-        className={cn("absolute top-0.5 h-5 w-5 rounded-full shadow", checked ? "right-0.5 bg-on-accent" : "left-0.5 bg-ink")}
-      />
-    </button>
-  );
-}
-
-function Row({ title, body, children }: { title: string; body?: ReactNode; children: ReactNode }) {
-  return (
-    <div className="flex items-center justify-between gap-8 py-4">
-      <div className="min-w-0">
-        <p className="text-sm font-medium">{title}</p>
-        {body && <p className="mt-1 max-w-[60ch] text-[13px] leading-relaxed text-ink-muted">{body}</p>}
-      </div>
-      {children}
-    </div>
-  );
-}
-
-function Group({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <section className="mt-10 first:mt-6">
-      <h2 className="text-lg font-semibold tracking-tight">{title}</h2>
-      <div className="mt-2 divide-y divide-line">{children}</div>
-    </section>
-  );
-}
 
 export function SettingsView() {
   const prefs = usePrefs((s) => s.prefs);
@@ -98,7 +57,16 @@ export function SettingsView() {
         >
           <Toggle label="Normalize volume" checked={prefs.normalize} onChange={(v) => set({ normalize: v })} />
         </Row>
+        <Row
+          title="Autoplay"
+          body="When your queue runs out, keep playing similar songs from your library, starting with the same artists, then the same genres and years. With Repeat on, your queue loops instead."
+        >
+          <Toggle label="Autoplay" checked={prefs.autoplay} onChange={(v) => set({ autoplay: v })} />
+        </Row>
+        <OutputSettings />
       </Group>
+
+      <EqualizerSettings />
 
       <Group title="Lyrics">
         <Row title="Karaoke highlighting" body="Fills each word as it's sung. Uses word timing when the lyrics have it, and estimates it otherwise.">
@@ -120,6 +88,8 @@ export function SettingsView() {
           <Toggle label="Spectrum bars" checked={ui.visualizer} onChange={(v) => setUi({ visualizer: v })} />
         </Row>
       </Group>
+
+      <IntegrationSettings />
 
       <Group title="Library">
         <div className="py-4">
@@ -175,6 +145,8 @@ export function SettingsView() {
           </PillButton>
         </Row>
       </Group>
+
+      <AboutSettings />
     </div>
   );
 }

@@ -8,6 +8,7 @@
 //!
 //! `norm * volume` is always smoothed over a short fixed ramp so slider moves never zipper.
 //! The primary track also feeds a mono copy of its signal into a [`Tap`] for the visualizer.
+//! Before any of that, the optional equalizer runs (see [`EqSettings`]).
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,6 +16,7 @@ use std::time::Duration;
 
 use rodio::source::SeekError;
 use rodio::{ChannelCount, Sample, SampleRate, Source};
+use serde::{Deserialize, Serialize};
 
 /// f32 stored in an AtomicU32.
 #[derive(Default)]
@@ -87,6 +89,144 @@ impl Tap {
     }
 }
 
+/// Centre frequencies of the 10-band graphic equalizer.
+pub const EQ_FREQS: [f32; 10] = [31.0, 62.0, 125.0, 250.0, 500.0, 1_000.0, 2_000.0, 4_000.0, 8_000.0, 16_000.0];
+/// One-octave bands.
+const GRAPHIC_Q: f32 = 1.41;
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum FilterKind {
+    Peak,
+    LowShelf,
+    HighShelf,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EqFilter {
+    pub kind: FilterKind,
+    pub freq: f32,
+    /// dB
+    pub gain: f32,
+    pub q: f32,
+}
+
+/// A parametric correction profile, e.g. imported from an AutoEQ `ParametricEQ.txt`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EqProfile {
+    pub name: String,
+    /// dB
+    pub preamp: f32,
+    pub filters: Vec<EqFilter>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct EqSettings {
+    pub enabled: bool,
+    /// dB per band in [`EQ_FREQS`].
+    pub bands: Vec<f32>,
+    /// dB, on top of the automatic headroom for boosted bands.
+    pub preamp: f32,
+    /// Applied before the graphic bands, so a headphone correction and your taste stack.
+    pub profile: Option<EqProfile>,
+}
+
+impl Default for EqSettings {
+    fn default() -> Self {
+        Self { enabled: false, bands: vec![0.0; EQ_FREQS.len()], preamp: 0.0, profile: None }
+    }
+}
+
+impl EqSettings {
+    /// The filters to run and the linear pre-gain. Empty when the EQ wouldn't change anything,
+    /// so a disabled or flat EQ costs nothing and keeps output bit-perfect.
+    pub fn plan(&self) -> (Vec<EqFilter>, f32) {
+        if !self.enabled {
+            return (vec![], 1.0);
+        }
+        let mut filters: Vec<EqFilter> = self.profile.iter().flat_map(|p| p.filters.iter().cloned()).collect();
+        filters.extend(
+            EQ_FREQS
+                .iter()
+                .zip(&self.bands)
+                .filter(|(_, g)| g.abs() > 0.01)
+                .map(|(&freq, &gain)| EqFilter { kind: FilterKind::Peak, freq, gain, q: GRAPHIC_Q }),
+        );
+        // Leave room for boosts so they can't clip.
+        let boost = self.bands.iter().cloned().fold(0.0f32, f32::max);
+        let pre_db = self.preamp + self.profile.as_ref().map_or(0.0, |p| p.preamp) - boost;
+        if filters.is_empty() && pre_db.abs() < 0.01 {
+            return (vec![], 1.0);
+        }
+        (filters, 10f32.powf(pre_db / 20.0))
+    }
+}
+
+/// Shared EQ settings; every playing track re-plans its filters when the version changes.
+pub struct EqCtl {
+    version: AtomicU32,
+    settings: Mutex<EqSettings>,
+}
+
+impl EqCtl {
+    pub fn new(settings: EqSettings) -> Arc<Self> {
+        Arc::new(Self { version: AtomicU32::new(1), settings: Mutex::new(settings) })
+    }
+    pub fn set(&self, settings: EqSettings) {
+        *self.settings.lock().unwrap_or_else(|e| e.into_inner()) = settings;
+        self.version.fetch_add(1, Ordering::Release);
+    }
+    /// Whether the EQ currently changes the signal at all.
+    pub fn is_active(&self) -> bool {
+        self.settings.lock().map(|s| !s.plan().0.is_empty() || s.plan().1 != 1.0).unwrap_or(false)
+    }
+}
+
+/// Normalized biquad coefficients (a0 = 1), from the RBJ Audio EQ Cookbook.
+#[derive(Clone, Copy, Debug)]
+struct Coeffs {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+}
+
+fn design(f: &EqFilter, rate: f32) -> Option<Coeffs> {
+    use std::f64::consts::PI;
+    if f.freq <= 0.0 || f.freq >= rate * 0.49 || f.q <= 0.0 {
+        return None;
+    }
+    let a = 10f64.powf(f.gain as f64 / 40.0);
+    let w0 = 2.0 * PI * f.freq as f64 / rate as f64;
+    let (sin, cos) = w0.sin_cos();
+    let alpha = sin / (2.0 * f.q as f64);
+    let sa = 2.0 * a.sqrt() * alpha;
+    let (b0, b1, b2, a0, a1, a2) = match f.kind {
+        FilterKind::Peak => (1.0 + alpha * a, -2.0 * cos, 1.0 - alpha * a, 1.0 + alpha / a, -2.0 * cos, 1.0 - alpha / a),
+        FilterKind::LowShelf => (
+            a * ((a + 1.0) - (a - 1.0) * cos + sa),
+            2.0 * a * ((a - 1.0) - (a + 1.0) * cos),
+            a * ((a + 1.0) - (a - 1.0) * cos - sa),
+            (a + 1.0) + (a - 1.0) * cos + sa,
+            -2.0 * ((a - 1.0) + (a + 1.0) * cos),
+            (a + 1.0) + (a - 1.0) * cos - sa,
+        ),
+        FilterKind::HighShelf => (
+            a * ((a + 1.0) + (a - 1.0) * cos + sa),
+            -2.0 * a * ((a - 1.0) + (a + 1.0) * cos),
+            a * ((a + 1.0) + (a - 1.0) * cos - sa),
+            (a + 1.0) - (a - 1.0) * cos + sa,
+            2.0 * ((a - 1.0) - (a + 1.0) * cos),
+            (a + 1.0) - (a - 1.0) * cos - sa,
+        ),
+    };
+    Some(Coeffs { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0 })
+}
+
 struct Smooth {
     cur: f32,
     target: f32,
@@ -127,6 +267,12 @@ pub struct Processed<S: Source> {
     master: Arc<Master>,
     ctl: Arc<TrackCtl>,
     tap: Arc<Tap>,
+    eq: Arc<EqCtl>,
+    eq_seen: u32,
+    eq_filters: Vec<Coeffs>,
+    /// Two state values per filter per channel.
+    eq_state: Vec<[f64; 2]>,
+    eq_pre: f32,
     channels: u16,
     rate: f32,
     channel: u16,
@@ -140,17 +286,22 @@ pub struct Processed<S: Source> {
 }
 
 impl<S: Source> Processed<S> {
-    pub fn new(inner: S, master: Arc<Master>, ctl: Arc<TrackCtl>, tap: Arc<Tap>) -> Self {
+    pub fn new(inner: S, master: Arc<Master>, ctl: Arc<TrackCtl>, tap: Arc<Tap>, eq: Arc<EqCtl>) -> Self {
         let channels = inner.channels().get();
         let rate = inner.sample_rate().get() as f32;
         let fade = ctl.fade_target.get();
         let level = ctl.norm.get() * master.volume.get();
-        Self {
+        let mut me = Self {
             inner,
             master,
             seen_version: ctl.fade_version.load(Ordering::Acquire),
             ctl,
             tap,
+            eq,
+            eq_seen: 0,
+            eq_filters: Vec::new(),
+            eq_state: Vec::new(),
+            eq_pre: 1.0,
             channels,
             rate,
             channel: 0,
@@ -160,10 +311,29 @@ impl<S: Source> Processed<S> {
             gain: fade * level,
             mono_acc: 0.0,
             pending: Vec::with_capacity(TAP_CHUNK),
+        };
+        me.refresh_eq();
+        me
+    }
+
+    /// Re-plans the EQ filters if the settings changed. Skips (and retries later) if the
+    /// settings are being written right now, so the audio thread never blocks.
+    fn refresh_eq(&mut self) {
+        let v = self.eq.version.load(Ordering::Acquire);
+        if v == self.eq_seen {
+            return;
         }
+        let Ok(settings) = self.eq.settings.try_lock() else { return };
+        let (filters, pre) = settings.plan();
+        drop(settings);
+        self.eq_seen = v;
+        self.eq_filters = filters.iter().filter_map(|f| design(f, self.rate)).collect();
+        self.eq_state = vec![[0.0; 2]; self.eq_filters.len() * self.channels as usize];
+        self.eq_pre = if self.eq_filters.is_empty() { 1.0 } else { pre };
     }
 
     fn refresh_controls(&mut self) {
+        self.refresh_eq();
         let v = self.ctl.fade_version.load(Ordering::Acquire);
         if v != self.seen_version {
             self.seen_version = v;
@@ -195,7 +365,20 @@ impl<S: Source> Iterator for Processed<S> {
 
     #[inline]
     fn next(&mut self) -> Option<Sample> {
-        let s = self.inner.next()?;
+        let mut s = self.inner.next()?;
+        if !self.eq_filters.is_empty() {
+            let ch = self.channel as usize;
+            let channels = self.channels as usize;
+            let mut y = (s * self.eq_pre) as f64;
+            for (i, c) in self.eq_filters.iter().enumerate() {
+                let z = &mut self.eq_state[i * channels + ch];
+                let out = c.b0 * y + z[0];
+                z[0] = c.b1 * y - c.a1 * out + z[1];
+                z[1] = c.b2 * y - c.a2 * out;
+                y = out;
+            }
+            s = y as f32;
+        }
         if self.channel == 0 {
             if self.frame_counter == 0 {
                 self.refresh_controls();
@@ -236,6 +419,7 @@ impl<S: Source> Source for Processed<S> {
     fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
         self.channel = 0;
         self.mono_acc = 0.0;
+        self.eq_state.iter_mut().for_each(|z| *z = [0.0; 2]);
         self.inner.try_seek(pos)
     }
 }
@@ -400,6 +584,41 @@ mod tests {
         let g = normalization_gain(Some(-20.0), Some(0.9), -14.0);
         assert!(g * 0.9 <= 1.0001);
         assert_eq!(normalization_gain(None, None, -14.0), 1.0);
+    }
+
+    #[test]
+    fn flat_or_disabled_eq_is_bypassed() {
+        let mut eq = EqSettings::default();
+        assert!(eq.plan().0.is_empty());
+        eq.enabled = true;
+        assert!(eq.plan().0.is_empty(), "a flat EQ must not process audio");
+        eq.bands[3] = 4.0;
+        let (filters, pre) = eq.plan();
+        assert_eq!(filters.len(), 1);
+        // A +4 dB boost gets 4 dB of headroom.
+        assert!((20.0 * pre.log10() + 4.0).abs() < 1e-3);
+    }
+
+    /// |H(e^jw)| in dB for a biquad.
+    fn response_db(c: &Coeffs, hz: f64, rate: f64) -> f64 {
+        let w = 2.0 * std::f64::consts::PI * hz / rate;
+        let (c1, s1, c2, s2) = (w.cos(), -w.sin(), (2.0 * w).cos(), -(2.0 * w).sin());
+        let num = (c.b0 + c.b1 * c1 + c.b2 * c2, c.b1 * s1 + c.b2 * s2);
+        let den = (1.0 + c.a1 * c1 + c.a2 * c2, c.a1 * s1 + c.a2 * s2);
+        20.0 * ((num.0 * num.0 + num.1 * num.1).sqrt() / (den.0 * den.0 + den.1 * den.1).sqrt()).log10()
+    }
+
+    #[test]
+    fn filters_hit_their_gain() {
+        let rate = 48_000.0;
+        let peak = design(&EqFilter { kind: FilterKind::Peak, freq: 1_000.0, gain: 6.0, q: 1.41 }, rate as f32).unwrap();
+        assert!((response_db(&peak, 1_000.0, rate) - 6.0).abs() < 0.05);
+        assert!(response_db(&peak, 100.0, rate).abs() < 0.3);
+        let low = design(&EqFilter { kind: FilterKind::LowShelf, freq: 105.0, gain: -5.0, q: 0.7 }, rate as f32).unwrap();
+        assert!((response_db(&low, 20.0, rate) + 5.0).abs() < 0.3);
+        assert!(response_db(&low, 5_000.0, rate).abs() < 0.1);
+        let high = design(&EqFilter { kind: FilterKind::HighShelf, freq: 10_000.0, gain: 3.0, q: 0.7 }, rate as f32).unwrap();
+        assert!((response_db(&high, 20_000.0, rate) - 3.0).abs() < 0.3);
     }
 
     #[test]

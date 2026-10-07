@@ -1,4 +1,5 @@
-//! Background workers: loudness measurement for normalization, and watched-folder sync.
+//! Background workers: audio analysis (loudness for normalization, spectral check for
+//! fake-lossless files), and watched-folder sync.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -31,14 +32,26 @@ impl Loudness {
     }
 }
 
-pub fn spawn_loudness(db: Arc<Db>, player: Sender<Cmd>) -> Loudness {
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CutoffResult {
+    id: i64,
+    cutoff_hz: i32,
+}
+
+/// Measures loudness (needed for normalization, so it goes first) and then checks lossless files
+/// for a lossy origin. Both come out of a single decode when a track needs both.
+pub fn spawn_loudness(app: AppHandle, db: Arc<Db>, player: Sender<Cmd>) -> Loudness {
     let (tx, rx) = mpsc::channel::<i64>();
     thread::Builder::new()
-        .name("reson-loudness".into())
+        .name("reson-analysis-bg".into())
         .spawn(move || loop {
             let mut batch: Vec<i64> = rx.try_iter().collect();
             if batch.is_empty() {
                 batch = db.tracks_missing_loudness(20).unwrap_or_default().into_iter().map(|(id, _)| id).collect();
+            }
+            if batch.is_empty() {
+                batch = db.tracks_missing_cutoff(10).unwrap_or_default();
             }
             if batch.is_empty() {
                 match rx.recv_timeout(Duration::from_secs(60)) {
@@ -48,19 +61,28 @@ pub fn spawn_loudness(db: Arc<Db>, player: Sender<Cmd>) -> Loudness {
                 }
             }
             for id in batch {
-                let Some((path, done)) = db.track_path(id) else { continue };
-                if done {
+                let Some((path, format, need_loudness, need_cutoff)) = db.analysis_job(id) else { continue };
+                if !need_loudness && !need_cutoff {
                     continue;
                 }
-                let (lufs, peak) = library::measure_loudness(Path::new(&path)).unwrap_or(UNMEASURABLE);
-                if db.set_loudness(id, lufs, peak).is_ok() {
-                    let _ = player.send(Cmd::Loudness { id, lufs, peak });
+                let (loudness, cutoff) = library::analyze(Path::new(&path), format.as_deref(), need_loudness, need_cutoff);
+                if need_loudness {
+                    let (lufs, peak) = loudness.unwrap_or(UNMEASURABLE);
+                    if db.set_loudness(id, lufs, peak).is_ok() {
+                        let _ = player.send(Cmd::Loudness { id, lufs, peak });
+                    }
+                }
+                if need_cutoff {
+                    let cutoff_hz = cutoff.unwrap_or(-1);
+                    if db.set_cutoff(id, cutoff_hz).is_ok() {
+                        let _ = app.emit("library:analysis", CutoffResult { id, cutoff_hz });
+                    }
                 }
                 // Stay out of the way of playback and the UI.
                 thread::sleep(Duration::from_millis(30));
             }
         })
-        .expect("spawn loudness thread");
+        .expect("spawn analysis thread");
     Loudness { tx }
 }
 

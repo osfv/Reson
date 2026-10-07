@@ -6,19 +6,25 @@
 //! With crossfade enabled, the next track instead gets its own deck that fades in while the old
 //! one fades out. Pause, resume, seek and manual skips use short gain ramps so they never click.
 
-use std::fs::File;
+use std::collections::HashSet;
+use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
+use rodio::mixer::Mixer;
+use rodio::{Player, Source};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::db::{Db, QueueSource};
-use crate::dsp::{normalization_gain, Master, Processed, Tap, TrackCtl};
+use crate::autoplay;
+use crate::db::{now, Db, QueueSource};
+use crate::decode::{self, BoxSource};
+use crate::dsp::{normalization_gain, EqCtl, EqSettings, Master, Processed, Tap, TrackCtl};
 use crate::media::MediaSession;
+use crate::output::{self, Output};
+use crate::presence::{PlayerEvent, PresenceTrack};
 
 const SETTINGS_KEY: &str = "player";
 const TICK: Duration = Duration::from_millis(100);
@@ -46,12 +52,31 @@ pub struct PlaybackPrefs {
     /// Seconds; 0 = gapless, no crossfade.
     pub crossfade: f32,
     pub normalize: bool,
+    pub eq: EqSettings,
+    /// Endpoint id; None = follow the Windows default device.
+    pub output_device: Option<String>,
+    /// WASAPI exclusive mode (bit-perfect when nothing else changes the signal).
+    pub exclusive: bool,
+    /// When the queue runs out (repeat off), keep playing similar songs from the library.
+    pub autoplay: bool,
 }
 
 impl Default for PlaybackPrefs {
     fn default() -> Self {
-        Self { crossfade: 0.0, normalize: true }
+        Self { crossfade: 0.0, normalize: true, eq: EqSettings::default(), output_device: None, exclusive: false, autoplay: true }
     }
+}
+
+/// What the output is doing, for the status line under Now Playing.
+#[derive(Serialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputStatus {
+    pub exclusive: bool,
+    pub rate: u32,
+    pub bits: u16,
+    /// Exclusive, 100% volume, no EQ or normalization gain, and the device is at least as deep
+    /// as the file: the samples reach the DAC unchanged.
+    pub bit_perfect: bool,
 }
 
 pub enum Cmd {
@@ -80,6 +105,8 @@ pub enum Cmd {
 struct Item {
     uid: u64,
     src: QueueSource,
+    /// Added by autoplay rather than by the user.
+    auto: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -87,6 +114,7 @@ struct Item {
 pub struct QueueEntry {
     uid: u64,
     id: i64,
+    auto: bool,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -100,6 +128,7 @@ pub struct Snapshot {
     repeat: Repeat,
     position: f64,
     duration: f64,
+    output: Option<OutputStatus>,
 }
 
 #[derive(Serialize, Clone)]
@@ -118,6 +147,9 @@ struct Saved {
     volume: f32,
     shuffle: bool,
     repeat: Repeat,
+    /// Indices into `ids` that autoplay added.
+    #[serde(default)]
+    auto: Vec<usize>,
 }
 
 pub struct PlayerHandle {
@@ -135,7 +167,15 @@ impl PlayerHandle {
 }
 
 /// `hwnd` is the main window handle, needed on Windows to register with the system media overlay.
-pub fn spawn(app: AppHandle, db: Arc<Db>, hwnd: Option<isize>, tap: Arc<Tap>, prefs: PlaybackPrefs) -> PlayerHandle {
+/// `listeners` get track changes and scrobbles (Discord, Last.fm).
+pub fn spawn(
+    app: AppHandle,
+    db: Arc<Db>,
+    hwnd: Option<isize>,
+    tap: Arc<Tap>,
+    prefs: PlaybackPrefs,
+    listeners: Vec<Sender<PlayerEvent>>,
+) -> PlayerHandle {
     let (tx, rx) = mpsc::channel();
     let snapshot = Arc::new(Mutex::new(Snapshot { volume: 0.8, ..Default::default() }));
     let shared = snapshot.clone();
@@ -144,6 +184,7 @@ pub fn spawn(app: AppHandle, db: Arc<Db>, hwnd: Option<isize>, tap: Arc<Tap>, pr
         .name("reson-audio".into())
         .spawn(move || {
             let mut engine = Engine::new(app, db, shared, tap, prefs);
+            engine.listeners = listeners;
             engine.media = MediaSession::new(hwnd, media_tx);
             engine.restore();
             engine.publish();
@@ -180,17 +221,30 @@ struct Deck {
     /// Number of sources we've appended that haven't finished yet (1, or 2 with a preload).
     queued: usize,
     preloaded: Option<Preloaded>,
+    /// Set when the next track couldn't be queued gaplessly (exclusive mode, different format).
+    preload_tried: bool,
     /// Whether this play has been counted in the listening history yet.
     counted: bool,
+    /// Unix time this track started, and whether it has been scrobbled.
+    started_at: i64,
+    scrobbled: bool,
 }
 
 struct Engine {
     app: AppHandle,
     db: Arc<Db>,
     shared: Arc<Mutex<Snapshot>>,
-    device: Option<MixerDeviceSink>,
+    device: Option<Output>,
+    /// Exclusive mode failed for the current settings; stay on the shared mixer until they change.
+    exclusive_failed: bool,
     master: Arc<Master>,
+    eq: Arc<EqCtl>,
     tap: Arc<Tap>,
+    listeners: Vec<Sender<PlayerEvent>>,
+    /// (has a track, playing) last sent to the taskbar buttons.
+    taskbar: Option<(bool, bool)>,
+    /// The current track as told to Discord / Last.fm.
+    presence: Option<PresenceTrack>,
     deck: Option<Deck>,
     /// Decks that are fading out (crossfade or manual skip), dropped after their deadline.
     fading: Vec<(Player, Instant)>,
@@ -211,6 +265,8 @@ struct Engine {
     media: Option<MediaSession>,
     /// Track id whose metadata was last pushed to the OS overlay and window title.
     announced: Option<i64>,
+    /// Queue item autoplay last tried to extend the queue after, so it asks the library once.
+    autoplay_tried: Option<u64>,
 }
 
 impl Engine {
@@ -220,8 +276,13 @@ impl Engine {
             db,
             shared,
             device: None,
+            exclusive_failed: false,
             master: Arc::new(Master { volume: crate::dsp::AtomicF32::new(0.64) }),
+            eq: EqCtl::new(prefs.eq.clone()),
             tap,
+            listeners: Vec::new(),
+            taskbar: None,
+            presence: None,
             deck: None,
             fading: Vec::new(),
             queue: vec![],
@@ -239,6 +300,7 @@ impl Engine {
             last_progress: Instant::now(),
             media: None,
             announced: None,
+            autoplay_tried: None,
         }
     }
 
@@ -247,7 +309,7 @@ impl Engine {
             .into_iter()
             .map(|src| {
                 self.next_uid += 1;
-                Item { uid: self.next_uid, src }
+                Item { uid: self.next_uid, src, auto: false }
             })
             .collect()
     }
@@ -256,17 +318,55 @@ impl Engine {
         let _ = self.app.emit("player:error", msg.into());
     }
 
-    fn device(&mut self) -> Option<&MixerDeviceSink> {
-        if self.device.is_none() {
-            match DeviceSinkBuilder::open_default_sink() {
-                Ok(mut d) => {
-                    d.log_on_drop(false);
-                    self.device = Some(d);
+    fn wants_exclusive(&self) -> bool {
+        cfg!(windows) && self.prefs.exclusive && !self.exclusive_failed
+    }
+
+    /// The mixer to play a `rate` / `channels` source on, (re)opening the output if needed.
+    /// Exclusive mode reopens the device whenever the format changes, so nothing is resampled.
+    fn mixer_for(&mut self, rate: u32, channels: u16) -> Option<Mixer> {
+        let exclusive = self.wants_exclusive();
+        let fits = self.device.as_ref().is_some_and(|d| match d.exclusive_format() {
+            Some(f) => exclusive && f == (rate, channels),
+            None => !exclusive,
+        });
+        if !fits {
+            // Anything still fading out belongs to the old output.
+            self.fading.clear();
+            self.device = None;
+            #[cfg(windows)]
+            if exclusive {
+                match output::open_exclusive(self.prefs.output_device.as_deref(), rate, channels) {
+                    Ok(o) => self.device = Some(o),
+                    Err(e) => {
+                        self.exclusive_failed = true;
+                        self.error(format!("Exclusive mode isn't available: {e}. Playing through the Windows mixer instead."));
+                    }
                 }
-                Err(e) => self.error(format!("No audio output available: {e}")),
+            }
+            if self.device.is_none() {
+                match output::open_shared(self.prefs.output_device.as_deref()) {
+                    Ok(o) => self.device = Some(o),
+                    Err(e) => self.error(format!("No audio output available: {e}")),
+                }
             }
         }
-        self.device.as_ref()
+        self.device.as_ref().map(|d| d.mixer().clone())
+    }
+
+    /// Closes the output and picks up where playback was, e.g. after switching devices.
+    fn reopen_output(&mut self) {
+        let (pos, playing) = (self.position(), self.playing);
+        self.retire_deck(0);
+        self.fading.clear();
+        self.device = None;
+        if let Some(idx) = self.index {
+            if playing {
+                self.load(idx, true, pos, 40);
+            } else if self.load(idx, false, 0.0, 0) {
+                self.pending_seek = Some(pos);
+            }
+        }
     }
 
     fn set_volume(&mut self, v: f32) {
@@ -284,11 +384,10 @@ impl Engine {
     }
 
     /// Decodes a queue item into a processed source with its own control block.
-    fn open(&self, item: &Item, fade: f32) -> Result<(Processed<Decoder<std::io::BufReader<File>>>, Arc<TrackCtl>), String> {
-        let file = File::open(&item.src.path).map_err(|e| e.to_string())?;
-        let decoder = Decoder::try_from(file).map_err(|e| e.to_string())?;
+    fn open(&self, item: &Item, fade: f32) -> Result<(Processed<BoxSource>, Arc<TrackCtl>), String> {
+        let decoder = decode::open(Path::new(&item.src.path), item.src.format.as_deref())?;
         let ctl = TrackCtl::new(fade, self.norm_for(&item.src));
-        Ok((Processed::new(decoder, self.master.clone(), ctl.clone(), self.tap.clone()), ctl))
+        Ok((Processed::new(decoder, self.master.clone(), ctl.clone(), self.tap.clone(), self.eq.clone()), ctl))
     }
 
     /// Fades the current deck out quickly (or over `ms`) and parks it until it's silent.
@@ -319,8 +418,8 @@ impl Engine {
                 return false;
             }
         };
-        let Some(device) = self.device() else { return false };
-        let player = Player::connect_new(device.mixer());
+        let Some(mixer) = self.mixer_for(source.sample_rate().get(), source.channels().get()) else { return false };
+        let player = Player::connect_new(&mixer);
         if !play {
             player.pause();
         }
@@ -336,7 +435,17 @@ impl Engine {
         if play {
             ctl.fade_to(1.0, fade_in_ms.max(8));
         }
-        self.deck = Some(Deck { player, ctl, uid: item.uid, queued: 1, preloaded: None, counted: false });
+        self.deck = Some(Deck {
+            player,
+            ctl,
+            uid: item.uid,
+            queued: 1,
+            preloaded: None,
+            preload_tried: false,
+            counted: false,
+            started_at: now(),
+            scrobbled: false,
+        });
         self.index = Some(idx);
         self.playing = play;
         true
@@ -425,6 +534,8 @@ impl Engine {
     }
 
     fn advance(&mut self, manual: bool) {
+        // Skipping past the last song asks again even if the library had nothing earlier.
+        self.autoplay(manual);
         if let Some((idx, play)) = self.next_index(manual) {
             self.start_at(idx, play);
         }
@@ -509,8 +620,44 @@ impl Engine {
     }
 
     fn enqueue(&mut self, sources: Vec<QueueSource>, next: bool) {
-        let at = if next { self.index.map(|i| i + 1).unwrap_or(0) } else { self.queue.len() };
+        let after = self.index.map(|i| i + 1).unwrap_or(0);
+        // "Add to queue" goes before any autoplay songs, which only fill in after what the user picked.
+        let first_auto = self.queue.iter().skip(after).position(|i| i.auto).map(|p| after + p);
+        let at = if next { after } else { first_auto.unwrap_or(self.queue.len()) };
         self.insert(sources, at);
+    }
+
+    /// Autoplay: while the last song plays (repeat off), adds a batch of similar songs from the
+    /// library so playback carries on, gaplessly or crossfaded like any other next song.
+    fn autoplay(&mut self, force: bool) {
+        let Some(idx) = self.index.filter(|i| i + 1 == self.queue.len()) else { return };
+        let uid = Some(self.queue[idx].uid);
+        if !self.prefs.autoplay || self.repeat != Repeat::Off || (!force && self.autoplay_tried == uid) {
+            return;
+        }
+        self.autoplay_tried = uid;
+        // What the user chose steers it; once only autoplay songs are left, they do.
+        let chosen: Vec<i64> = self.queue.iter().rev().filter(|i| !i.auto).take(25).map(|i| i.src.id).collect();
+        let seeds = if chosen.is_empty() { self.queue.iter().rev().take(10).map(|i| i.src.id).collect() } else { chosen };
+        let Ok(candidates) = self.db.autoplay_candidates() else { return };
+        let mut exclude: HashSet<i64> = self.queue.iter().map(|i| i.src.id).collect();
+        exclude.extend(self.db.recent_plays(50).unwrap_or_default());
+        let mut ids = autoplay::pick(&seeds, &candidates, &exclude, autoplay::BATCH, fastrand::f64);
+        if ids.is_empty() {
+            // Everything has been played lately: allow repeats, just not the last few songs.
+            let recent: HashSet<i64> = self.queue.iter().rev().take(10).map(|i| i.src.id).collect();
+            ids = autoplay::pick(&seeds, &candidates, &recent, autoplay::BATCH, fastrand::f64);
+        }
+        let sources = self.db.queue_sources(&ids).unwrap_or_default();
+        if sources.is_empty() {
+            return;
+        }
+        let items: Vec<Item> = self.items(sources).into_iter().map(|i| Item { auto: true, ..i }).collect();
+        if let Some(orig) = &mut self.original {
+            orig.extend(items.iter().cloned());
+        }
+        self.queue.extend(items);
+        self.publish();
     }
 
     fn move_item(&mut self, uid: u64, to: usize) {
@@ -599,7 +746,15 @@ impl Engine {
             }
             Cmd::Remove(uid) => self.remove(uid),
             Cmd::Prefs(p) => {
+                let output_changed = p.output_device != self.prefs.output_device || p.exclusive != self.prefs.exclusive;
+                if p.eq != self.prefs.eq {
+                    self.eq.set(p.eq.clone());
+                }
                 self.prefs = p;
+                if output_changed {
+                    self.exclusive_failed = false;
+                    self.reopen_output();
+                }
                 let current = self.index.and_then(|i| self.queue.get(i)).map(|i| i.src.clone());
                 if let (Some(d), Some(src)) = (&self.deck, current) {
                     d.ctl.norm.set(self.norm_for(&src));
@@ -623,12 +778,21 @@ impl Engine {
         }
         let remaining = self.duration() - self.position();
         let Some(deck) = &self.deck else { return };
-        if deck.preloaded.is_some() || remaining > PRELOAD_BEFORE || self.duration() <= 0.0 {
+        if deck.preloaded.is_some() || deck.preload_tried || remaining > PRELOAD_BEFORE || self.duration() <= 0.0 {
             return;
         }
+        self.autoplay(false);
         let Some((idx, true)) = self.next_index(false) else { return };
         let item = self.queue[idx].clone();
+        let format = self.device.as_ref().and_then(|d| d.exclusive_format());
+        if let Some(deck) = self.deck.as_mut() {
+            deck.preload_tried = true;
+        }
         if let Ok((source, ctl)) = self.open(&item, 1.0) {
+            // Exclusive mode can't change sample rate mid-stream; that track starts fresh instead.
+            if format.is_some_and(|f| f != (source.sample_rate().get(), source.channels().get())) {
+                return;
+            }
             let deck = self.deck.as_mut().unwrap();
             deck.player.append(source);
             deck.queued = 2;
@@ -646,6 +810,7 @@ impl Engine {
         if dur < cf * 2.0 + 1.0 || dur - pos > cf || dur - pos < 0.2 {
             return false;
         }
+        self.autoplay(false);
         let Some((idx, true)) = self.next_index(false) else { return false };
         let ms = (cf * 1000.0) as u32;
         if let Some(deck) = self.deck.take() {
@@ -675,6 +840,9 @@ impl Engine {
                     deck.ctl = pre.ctl;
                     deck.uid = pre.uid;
                     deck.counted = false;
+                    deck.preload_tried = false;
+                    deck.started_at = now();
+                    deck.scrobbled = false;
                 }
                 match self.queue.iter().position(|i| i.uid == pre.uid) {
                     // The queue still agrees with what we preloaded: seamless.
@@ -691,6 +859,13 @@ impl Engine {
     fn tick(&mut self) {
         let now = Instant::now();
         self.fading.retain(|(_, until)| *until > now);
+
+        if self.device.as_ref().is_some_and(|d| !d.alive()) {
+            self.exclusive_failed = true;
+            self.error("Lost exclusive access to the audio device. Switched to the Windows mixer.");
+            self.reopen_output();
+            self.publish();
+        }
 
         if self.playing {
             if let Some(deck) = &self.deck {
@@ -715,23 +890,62 @@ impl Engine {
         }
     }
 
-    /// Records a play once a track has been heard for 30 s or half its length.
+    /// Records a play once a track has been heard for 30 s or half its length, and scrobbles it
+    /// by Last.fm's rule (longer than 30 s, played for half its length or 4 minutes).
     fn count_play(&mut self) {
-        let threshold = (self.duration() * 0.5).min(30.0).max(1.0);
+        let duration = self.duration();
+        let threshold = (duration * 0.5).min(30.0).max(1.0);
         let pos = self.position();
         let id = self.index.and_then(|i| self.queue.get(i)).map(|i| i.src.id);
-        if let (Some(deck), Some(id)) = (&mut self.deck, id) {
+        let Some(id) = id else { return };
+        let mut scrobble = None;
+        if let Some(deck) = &mut self.deck {
             if !deck.counted && pos >= threshold {
                 deck.counted = true;
                 let _ = self.db.record_play(id);
                 let _ = self.app.emit("history:changed", ());
             }
+            if !deck.scrobbled && duration > 30.0 && pos >= (duration * 0.5).min(240.0) {
+                deck.scrobbled = true;
+                scrobble = Some(deck.started_at);
+            }
         }
+        if let Some(started_at) = scrobble {
+            if let Some(track) = self.presence_track(id) {
+                self.send(PlayerEvent::Scrobble { track, started_at });
+            }
+        }
+    }
+
+    fn presence_track(&self, id: i64) -> Option<PresenceTrack> {
+        self.db.now_playing_info(id).ok().flatten().map(|i| PresenceTrack {
+            id,
+            album_id: i.album_id,
+            title: i.title,
+            artist: i.artist,
+            album: i.album,
+            album_artist: i.album_artist,
+            duration: i.duration,
+        })
+    }
+
+    fn send(&mut self, event: PlayerEvent) {
+        self.listeners.retain(|l| l.send(event.clone()).is_ok());
+    }
+
+    fn output_status(&self) -> Option<OutputStatus> {
+        let d = self.device.as_ref()?;
+        let (rate, _) = d.exclusive_format()?;
+        let bits = d.exclusive_bits().unwrap_or(0);
+        let src_bits = self.index.and_then(|i| self.queue.get(i)).and_then(|i| i.src.bit_depth).unwrap_or(16) as u16;
+        let norm = self.deck.as_ref().map(|d| d.ctl.norm.get()).unwrap_or(1.0);
+        let bit_perfect = self.volume >= 1.0 && norm == 1.0 && !self.eq.is_active() && bits >= src_bits;
+        Some(OutputStatus { exclusive: true, rate, bits, bit_perfect })
     }
 
     fn snapshot(&self) -> Snapshot {
         Snapshot {
-            queue: self.queue.iter().map(|i| QueueEntry { uid: i.uid, id: i.src.id }).collect(),
+            queue: self.queue.iter().map(|i| QueueEntry { uid: i.uid, id: i.src.id, auto: i.auto }).collect(),
             index: self.index,
             playing: self.playing,
             volume: self.volume,
@@ -739,6 +953,7 @@ impl Engine {
             repeat: self.repeat,
             position: self.position(),
             duration: self.duration(),
+            output: self.output_status(),
         }
     }
 
@@ -761,6 +976,7 @@ impl Engine {
             if let Some(m) = &mut self.media {
                 m.set_track(info.as_ref());
             }
+            self.presence = current.and_then(|id| self.presence_track(id));
             let title = info.map(|i| format!("{} - {}", i.title, i.artist)).unwrap_or_else(|| "Reson".into());
             if let Some(w) = self.app.get_webview_window("main") {
                 let _ = w.set_title(&title);
@@ -772,6 +988,13 @@ impl Engine {
         if let Some(m) = &mut self.media {
             m.set_state(current.is_some(), snap.playing, snap.position);
         }
+        let buttons = (current.is_some(), snap.playing);
+        if self.taskbar != Some(buttons) {
+            self.taskbar = Some(buttons);
+            crate::taskbar::update(&self.app, buttons.0, buttons.1);
+        }
+        let track = self.presence.clone();
+        self.send(PlayerEvent::State { track, playing: snap.playing, position: snap.position });
     }
 
     fn save(&mut self) {
@@ -786,6 +1009,7 @@ impl Engine {
             volume: self.volume,
             shuffle: self.shuffle,
             repeat: self.repeat,
+            auto: self.queue.iter().enumerate().filter(|(_, i)| i.auto).map(|(p, _)| p).collect(),
         };
         if let Ok(json) = serde_json::to_string(&saved) {
             let _ = self.db.set_setting(SETTINGS_KEY, &json);
@@ -805,6 +1029,13 @@ impl Engine {
         let sources = self.db.queue_sources(&saved.ids).unwrap_or_default();
         let complete = sources.len() == saved.ids.len();
         self.queue = self.items(sources);
+        if complete {
+            for &p in &saved.auto {
+                if let Some(item) = self.queue.get_mut(p) {
+                    item.auto = true;
+                }
+            }
+        }
         if complete {
             self.original = saved
                 .original
