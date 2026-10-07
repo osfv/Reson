@@ -83,6 +83,14 @@ impl Fft {
     }
 }
 
+/// FFT bins covering `lo..hi` Hz, kept inside the spectrum. Bands above Nyquist (files sampled
+/// below ~32 kHz) collapse onto the top bin instead of indexing past the end.
+fn band_bins(lo: f32, hi: f32, bin_hz: f32) -> std::ops::Range<usize> {
+    let i0 = ((lo / bin_hz) as usize).clamp(1, N / 2 - 1);
+    let i1 = ((hi / bin_hz).ceil() as usize).clamp(i0 + 1, N / 2);
+    i0..i1
+}
+
 pub fn spawn(app: AppHandle, initial: Arc<Tap>) -> Analyzer {
     let enabled = Arc::new(AtomicBool::new(false));
     let tap = Arc::new(Mutex::new(initial));
@@ -137,8 +145,7 @@ fn run(app: AppHandle, enabled: Arc<AtomicBool>, tap: Arc<Mutex<Arc<Tap>>>) {
         for (b, db) in dbs.iter_mut().enumerate() {
             let lo = MIN_HZ * (MAX_HZ / MIN_HZ).powf(b as f32 / BANDS as f32);
             let hi = MIN_HZ * (MAX_HZ / MIN_HZ).powf((b + 1) as f32 / BANDS as f32);
-            let (i0, i1) = (((lo / bin_hz) as usize).max(1), ((hi / bin_hz).ceil() as usize).clamp(2, N / 2));
-            let peak = mags[i0..i1.max(i0 + 1)].iter().cloned().fold(0.0, f32::max);
+            let peak = mags[band_bins(lo, hi, bin_hz)].iter().cloned().fold(0.0, f32::max);
             // Music falls off ~3-4.5 dB per octave; compensate so the highs aren't flat on the floor.
             let center = (lo * hi).sqrt();
             let tilt_db = (4.5 * (center / 1000.0).log2()).clamp(-6.0, 12.0);
@@ -176,6 +183,19 @@ fn run(app: AppHandle, enabled: Arc<AtomicBool>, tap: Arc<Mutex<Arc<Tap>>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn band_bins_stay_in_range_for_low_sample_rates() {
+        for rate in [8_000.0, 11_025.0, 16_000.0, 22_050.0, 44_100.0, 192_000.0] {
+            let bin_hz = rate / N as f32;
+            for b in 0..BANDS {
+                let lo = MIN_HZ * (MAX_HZ / MIN_HZ).powf(b as f32 / BANDS as f32);
+                let hi = MIN_HZ * (MAX_HZ / MIN_HZ).powf((b + 1) as f32 / BANDS as f32);
+                let r = band_bins(lo, hi, bin_hz);
+                assert!(r.start < r.end && r.end <= N / 2, "rate {rate} band {b}: {r:?}");
+            }
+        }
+    }
 
     #[test]
     fn fft_finds_a_tone() {

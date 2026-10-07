@@ -72,10 +72,19 @@ export function PlaylistView({ id, rename }: { id: number; rename?: boolean }) {
   const navigate = useUi((s) => s.navigate);
   const openMenu = useUi((s) => s.openMenu);
 
-  const tracks = useMemo(
-    () => (playlist?.trackIds ?? []).map((tid) => trackById.get(tid)).filter((t): t is Track => t != null),
-    [playlist, trackById],
-  );
+  // Hidden (missing) tracks stay in the playlist, so visible rows map back to their real positions.
+  const { tracks, positions } = useMemo(() => {
+    const tracks: Track[] = [];
+    const positions: number[] = [];
+    (playlist?.trackIds ?? []).forEach((tid, pos) => {
+      const t = trackById.get(tid);
+      if (t) {
+        tracks.push(t);
+        positions.push(pos);
+      }
+    });
+    return { tracks, positions };
+  }, [playlist, trackById]);
   const playingHere = usePlayer((s) => {
     const cur = s.index != null ? s.queue[s.index]?.id : undefined;
     return s.playing && cur != null && playlist?.trackIds.includes(cur) === true;
@@ -86,9 +95,9 @@ export function PlaylistView({ id, rename }: { id: number; rename?: boolean }) {
   const total = tracks.reduce((s, t) => s + t.duration, 0);
 
   const move = (from: number, to: number) => {
-    const next = [...ids];
-    const [item] = next.splice(from, 1);
-    next.splice(to, 0, item);
+    const next = [...playlist.trackIds];
+    const [item] = next.splice(positions[from], 1);
+    next.splice(positions[to], 0, item);
     setPlaylistTracks(playlist.id, next);
   };
 
@@ -135,7 +144,7 @@ export function PlaylistView({ id, rename }: { id: number; rename?: boolean }) {
       </div>
 
       {tracks.length ? (
-        <TrackList tracks={tracks} playlistId={playlist.id} onMove={move} />
+        <TrackList tracks={tracks} playlistId={playlist.id} positions={positions} onMove={move} />
       ) : (
         <div className="mx-8 rounded-2xl bg-white/[0.03] px-8 py-10">
           <h2 className="text-lg font-semibold tracking-tight">Start filling this playlist</h2>
