@@ -25,6 +25,12 @@ Verify changes with `npm run typecheck` and `cargo check` at minimum; run `cargo
   Never auto-delete tracks whose files vanish: `mark_missing` hides them (`tracks.missing = 1`) and
   `upsert_track` / `merge_moved` relink a moved file to its old row by title + artist + album + duration, so
   lyrics offsets, play history and playlist entries survive. Only explicit "Remove from library" deletes.
+  `library::import` takes `scan_lock` itself (callers must not), so imports run one at a time. A user import
+  emits `library:scan` before waiting for the lock and bumps `scan_waiting`, which makes a running quiet
+  (watched-folder) sync show its progress; otherwise a long sync of a network share hides the user's import
+  completely. Each file is imported under `catch_unwind` so a decoder panic can't end an import unannounced.
+  Import regression tests (`cargo test library::tests`) use generated audio and in-memory databases, not the
+  user's library. Register folder watches only after `app.manage`, since their worker also reads `AppState`.
 - `src-tauri/src/lyrics.rs`: lyrics lookup via the async `lyrics_get` command. Order: sidecar `.lrc` (never
   cached) > embedded tag > LRCLIB `/api/get` (exact signature) > `/api/search` (only results within ±4 s of the
   track length). Results, including misses, are cached in the `lyrics` table; misses are retried after 3 days.

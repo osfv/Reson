@@ -139,12 +139,12 @@ pub fn spawn_watch(app: AppHandle) -> Watch {
                     continue;
                 }
                 let changed: Vec<PathBuf> = pending.drain().collect();
-                let state = app.state::<AppState>();
-                let _guard = state.scan_lock.lock().unwrap_or_else(|e| e.into_inner());
                 let existing: Vec<PathBuf> = changed.iter().filter(|p| p.exists()).cloned().collect();
                 if !existing.is_empty() {
-                    library::import(&app, &state.db, &state.covers_dir, existing, true);
+                    library::import(&app, existing, true);
                 }
+                let state = app.state::<AppState>();
+                let _guard = state.scan_lock.lock().unwrap_or_else(|e| e.into_inner());
                 if changed.iter().any(|p| !p.exists()) && state.db.mark_missing().unwrap_or(false) {
                     let _ = app.emit("library:changed", ());
                 }

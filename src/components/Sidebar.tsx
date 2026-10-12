@@ -54,9 +54,11 @@ function ScanStatus() {
           role="status"
         >
           <div className="flex items-baseline justify-between text-xs">
-            <span className="font-medium text-ink">Importing</span>
+            <span className="font-medium text-ink">{scan.listing ? "Finding songs" : "Importing"}</span>
             <span className="font-mono text-ink-muted tabular-nums">
-              {scan.done.toLocaleString()} / {scan.total.toLocaleString()}
+              {scan.listing
+                ? scan.total > 0 && scan.total.toLocaleString()
+                : `${scan.done.toLocaleString()} / ${scan.total.toLocaleString()}`}
             </span>
           </div>
           <div className="mt-2 h-0.5 overflow-hidden rounded-full bg-white/10">

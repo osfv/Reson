@@ -20,7 +20,7 @@ mod taskbar;
 mod updater;
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -91,6 +91,8 @@ pub struct AppState {
     pub player: player::PlayerHandle,
     pub covers_dir: PathBuf,
     pub scan_lock: Mutex<()>,
+    /// User-started imports waiting for `scan_lock`.
+    pub scan_waiting: AtomicUsize,
     pub prefs: Mutex<Prefs>,
     pub analyzer: analysis::Analyzer,
     pub loudness: background::Loudness,
@@ -278,24 +280,14 @@ pub fn run() {
             }
             let loudness = background::spawn_loudness(app.handle().clone(), db.clone(), player.sender());
             let watch = background::spawn_watch(app.handle().clone());
-            watch.set_folders(&prefs.watch_folders);
-
-            // Pick up anything added to watched folders while Reson was closed.
-            if !prefs.watch_folders.is_empty() {
-                let handle = app.handle().clone();
-                let folders: Vec<PathBuf> = prefs.watch_folders.iter().map(PathBuf::from).collect();
-                std::thread::spawn(move || {
-                    let state = handle.state::<AppState>();
-                    let _guard = state.scan_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    library::import(&handle, &state.db, &state.covers_dir, folders, true);
-                });
-            }
+            let folders = prefs.watch_folders.clone();
 
             app.manage(AppState {
                 db,
                 player,
                 covers_dir,
                 scan_lock: Mutex::new(()),
+                scan_waiting: AtomicUsize::new(0),
                 prefs: Mutex::new(prefs),
                 analyzer,
                 loudness,
@@ -304,6 +296,14 @@ pub fn run() {
                 lastfm,
                 update: Mutex::new(None),
             });
+
+            // Pick up anything added to watched folders while Reson was closed. Started after
+            // `manage`: reading the state before it's registered panics.
+            if !folders.is_empty() {
+                app.state::<AppState>().watch.set_folders(&folders);
+                let handle = app.handle().clone();
+                std::thread::spawn(move || library::import(&handle, folders.into_iter().map(PathBuf::from).collect(), true));
+            }
             build_tray(app.handle())?;
             spawn_update_checks(app.handle().clone());
             Ok(())

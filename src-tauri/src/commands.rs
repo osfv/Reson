@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::ipc::{InvokeBody, Request, Response};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::db::{History, Library, Playlist, SmartPlaylist, YearStats};
@@ -31,10 +31,7 @@ pub fn get_library(state: State<AppState>) -> Res<Library> {
 #[tauri::command]
 pub fn import_paths(app: AppHandle, paths: Vec<String>) {
     thread::spawn(move || {
-        let state = app.state::<AppState>();
-        let _guard = state.scan_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let paths = paths.into_iter().map(PathBuf::from).collect();
-        library::import(&app, &state.db, &state.covers_dir, paths, false);
+        library::import(&app, paths.into_iter().map(PathBuf::from).collect(), false);
     });
 }
 

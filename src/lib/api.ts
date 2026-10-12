@@ -149,6 +149,8 @@ export interface ScanProgress {
   active: boolean;
   failed: number;
   failedNames: string[];
+  /** Still walking the folders; `total` is the number of songs found so far. */
+  listing: boolean;
 }
 
 export interface Lyrics {
