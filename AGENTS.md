@@ -128,7 +128,7 @@ cropped, 1600px wide, no audio), encoded with ffmpeg from the raw OBS clip. Scru
 - Releases: bump `version` in `tauri.conf.json`, `src-tauri/Cargo.toml` and `package.json`, run
   `npm run tauri build` (~10 min; NSIS + MSI land in `src-tauri/target/release/bundle/`), smoke-test
   `target/release/reson.exe`, then sign the NSIS installer with
-  `npx tauri signer sign -f ~/.tauri/reson.key -p "" <setup.exe>` (the private key lives only in
+  `npx tauri signer sign -f ~/.tauri/reson.key -p "" --app-version X.Y.Z <setup.exe>` (the private key lives only in
   `C:\Users\fearl\.tauri\`, never in the repo), write `latest.json` (`version`, `notes`, `pub_date`,
   `platforms.windows-x86_64.{signature: contents of the .sig, url: release asset URL}`), tag `vX.Y.Z`, and
   `gh release create` with both installers, `latest.json` and the SHA-256s. Losing the key means existing installs
